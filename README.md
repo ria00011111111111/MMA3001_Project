@@ -1,3 +1,3 @@
-## MMA 3001
-# 🤖 AI Acknowledgement 
+# MMA 3001
+## 🤖 AI Acknowledgement 
 Generative AI tools, including OpenAI ChatGPT, were used during the development of this project to assist with brainstorming ideas, explaining programming concepts, improving the formatting and clarity of documentation, and generating example code based on prompts and original content provided by the author. All AI-generated outputs were critically reviewed, tested, and modified where necessary before being incorporated into the project. The author remains responsible for verifying the accuracy and appropriateness of all code, analysis, and written content included in the final submission.
