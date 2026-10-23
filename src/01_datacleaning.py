@@ -1,142 +1,209 @@
 
-import pandas as pd
 import json
+import zipfile
 from pathlib import Path
 
-# ==================================================
-# 1. LOAD DATA
-# ==================================================
+import pandas as pd
 
-ROOT = Path(__file__).resolve().parent.parent
 
-DATA_FILE = ROOT / "data" / "5EnvSensor_MayToDec2024_180kRows.zip"
-OUTPUT_FILE = ROOT / "data" / "cleaned_sensor_data.csv"
-DIAGNOSTICS_DIR = ROOT / "outputs" / "data_quality"
+# ============================================================
+# 1. PROJECT PATHS
+# ============================================================
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+DATA_FILE = (
+    PROJECT_ROOT / "data" / "5EnvSensor_MayToDec2024_180kRows.zip"
+)
+
+OUTPUT_DIR = PROJECT_ROOT / "data"
+DIAGNOSTICS_DIR = PROJECT_ROOT / "outputs" / "diagnostics"
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
 
-if not DATA_FILE.exists():
-    raise FileNotFoundError(f"Input data not found: {DATA_FILE}")
 
-df = pd.read_csv(DATA_FILE, low_memory=False)
-
-print("=" * 65)
-print("MMA3001 - DATA CLEANING")
-print("=" * 65)
-print("Original dataset shape:", df.shape)
-print("Original columns:", df.columns.tolist())
-
-
-# ==================================================
-# 2. INSPECT RAW JSON
-# ==================================================
+# ============================================================
+# 2. LOAD DATA
+# ============================================================
 
 print("\n" + "=" * 65)
-print("RAW JSON INSPECTION")
+print("STEP 1: LOADING DATA")
 print("=" * 65)
 
-sensor_rows = df[
-    df["sensorid"].astype(str) == "6012002000227"
-]
+if not DATA_FILE.exists():
+    raise FileNotFoundError(
+        f"Dataset not found: {DATA_FILE}\n"
+        "Check that the ZIP file is inside the data folder."
+    )
 
-for row_index in sensor_rows.index[:2]:
-    row = df.loc[row_index]
+print("Input file:", DATA_FILE)
 
-    print(f"\nRecord ID: {row.get('id')}")
-    print(f"Sensor ID: {row.get('sensorid')}")
-    print(f"Database creation time: {row.get('createdate')}")
-    print(f"Processing time: {row.get('processdate')}")
+with zipfile.ZipFile(DATA_FILE, "r") as archive:
+    csv_files = [
+        name for name in archive.namelist()
+        if name.lower().endswith(".csv")
+    ]
+
+    if not csv_files:
+        raise ValueError("No CSV file found inside the ZIP archive.")
+
+    if len(csv_files) > 1:
+        print("CSV files found:", csv_files)
+        print("Using:", csv_files[0])
+
+    with archive.open(csv_files[0]) as file:
+        df = pd.read_csv(file)
+
+print("Rows loaded:", len(df))
+print("Columns:", df.columns.tolist())
+
+required_columns = {"sensorid", "jsondata", "createdate"}
+missing_columns = required_columns - set(df.columns)
+
+if missing_columns:
+    raise ValueError(
+        f"Missing required columns: {sorted(missing_columns)}"
+    )
+
+df["source_row"] = range(1, len(df) + 1)
+
+# Parse record creation times as UTC.
+df["createdate_parsed"] = pd.to_datetime(
+    df["createdate"],
+    errors="coerce",
+    utc=True,
+)
+
+
+# ============================================================
+# 3. EXTRACT SENSOR MEASUREMENTS
+# ============================================================
+
+print("\n" + "=" * 65)
+print("STEP 2: EXTRACTING SENSOR MEASUREMENTS")
+print("=" * 65)
+
+
+def extract_measurements(json_value):
+    """
+    Extract measurements from the dataset's JSON list.
+
+    Each list item contains:
+        variable: {"name": "..."}
+        values: [{"time": ..., "value": ...}]
+    """
+
+    if pd.isna(json_value):
+        return {"total_json_readings": 0}
 
     try:
-        raw_json = json.loads(row["jsondata"])
-        print(json.dumps(raw_json, indent=2))
-    except (json.JSONDecodeError, TypeError):
-        print("Could not parse raw JSON.")
+        data = json.loads(json_value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {"total_json_readings": 0}
 
+    if not isinstance(data, list):
+        return {"total_json_readings": 0}
 
-# ==================================================
-# 3. REMOVE EXACT DUPLICATE ROWS
-# ==================================================
+    result = {}
+    total_readings = 0
 
-before = len(df)
-df = df.drop_duplicates().copy()
-
-print("\nExact duplicate rows removed:", before - len(df))
-
-
-# ==================================================
-# 4. EXTRACT SENSOR READINGS
-# ==================================================
-
-def extract_sensor_data(json_string):
-    if pd.isna(json_string):
-        return {}
-
-    try:
-        readings = json.loads(json_string)
-    except (json.JSONDecodeError, TypeError):
-        return {}
-
-    if not isinstance(readings, list):
-        return {}
-
-    extracted = {}
-
-    for item in readings:
-        if not isinstance(item, dict):
+    for measurement in data:
+        if not isinstance(measurement, dict):
             continue
 
-        variable = item.get("variable", {})
-        values = item.get("values", [])
+        variable = measurement.get("variable", {})
 
         if not isinstance(variable, dict):
             continue
 
         name = variable.get("name")
 
-        if not name or not isinstance(values, list):
+        if not name:
             continue
 
-        extracted[name + " number_of_values"] = len(values)
+        values = measurement.get("values", [])
+
+        if not isinstance(values, list):
+            continue
+
+        total_readings += len(values)
 
         if not values:
-            extracted[name] = None
-            extracted[name + " unit"] = variable.get("unit")
-            extracted[name + " time"] = None
+            result[name] = None
+            result[f"{name} time"] = None
+            result[f"{name} number_of_values"] = 0
             continue
 
-        reading = values[0]
+        first = values[0]
 
-        if not isinstance(reading, dict):
-            extracted[name] = None
-            extracted[name + " unit"] = variable.get("unit")
-            extracted[name + " time"] = None
+        if not isinstance(first, dict):
             continue
 
-        extracted[name] = (
-            None
-            if reading.get("errorCode") is not None
-            else reading.get("value")
-        )
+        result[name] = first.get("value")
+        result[f"{name} time"] = first.get("time")
+        result[f"{name} number_of_values"] = len(values)
 
-        extracted[name + " unit"] = variable.get("unit")
-        extracted[name + " time"] = reading.get("time")
+    result["total_json_readings"] = total_readings
 
-    return extracted
+    return result
 
 
-sensor_data = df["jsondata"].apply(extract_sensor_data)
-sensor_data = pd.DataFrame(sensor_data.tolist(), index=df.index)
+extracted = df["jsondata"].apply(extract_measurements)
 
-df = pd.concat(
-    [df.drop(columns=["jsondata"]), sensor_data],
-    axis=1
+measurements_df = pd.DataFrame(
+    extracted.tolist(),
+    index=df.index,
 )
 
+df = pd.concat(
+    [df.drop(columns=["jsondata"]), measurements_df],
+    axis=1,
+)
 
-# ==================================================
-# 5. CONVERT TIMESTAMPS
-# ==================================================
+print("Measurement fields extracted:", len(measurements_df.columns))
+print("Measurement columns:", [
+    column for column in measurements_df.columns
+    if not column.endswith(" time")
+    and not column.endswith(" number_of_values")
+    and column != "total_json_readings"
+])
+print("Rows after extraction:", len(df))
+
+
+# ============================================================
+# 4. CONVERT TIMESTAMPS TO UTC
+# ============================================================
+
+print("\n" + "=" * 65)
+print("STEP 3: CONVERTING TIMESTAMPS")
+print("=" * 65)
+
+
+def convert_timestamp(series):
+    """Convert Unix timestamps in seconds or date strings to UTC."""
+
+    numeric = pd.to_numeric(series, errors="coerce")
+
+    result = pd.to_datetime(
+        numeric,
+        unit="s",
+        errors="coerce",
+        utc=True,
+    )
+
+    non_numeric = numeric.isna() & series.notna()
+
+    if non_numeric.any():
+        result.loc[non_numeric] = pd.to_datetime(
+            series.loc[non_numeric],
+            errors="coerce",
+            utc=True,
+            format="mixed",
+        )
+
+    return pd.to_datetime(result, errors="coerce", utc=True)
+
 
 time_columns = [
     column for column in df.columns
@@ -144,279 +211,344 @@ time_columns = [
 ]
 
 for column in time_columns:
-    raw = df[column]
-    numeric = pd.to_numeric(raw, errors="coerce")
+    df[column] = convert_timestamp(df[column])
 
-    numeric_mask = raw.notna() & numeric.notna()
-
-    converted = pd.Series(
-        pd.NaT,
-        index=df.index,
-        dtype="datetime64[ns, UTC]"
+if "Carbon dioxide time" not in df.columns:
+    raise ValueError(
+        "Carbon dioxide time was not extracted. "
+        "Check the JSON structure and measurement names."
     )
 
-    # Assumes numeric sensor timestamps are Unix seconds.
-    converted.loc[numeric_mask] = pd.to_datetime(
-        numeric.loc[numeric_mask],
-        unit="s",
-        errors="coerce",
-        utc=True
-    )
-
-    string_mask = raw.notna() & ~numeric_mask
-
-    if string_mask.any():
-        converted.loc[string_mask] = pd.to_datetime(
-            raw.loc[string_mask],
-            errors="coerce",
-            utc=True,
-            format="mixed"
-        )
-
-    df[column] = converted
-
-
-# ==================================================
-# 6. TIMESTAMP DIAGNOSTICS
-# ==================================================
-
-print("\n" + "=" * 65)
-print("TIMESTAMP DIAGNOSTICS")
-print("=" * 65)
-
-count_columns = [
-    column for column in df.columns
-    if column.endswith(" number_of_values")
-]
-
-if count_columns:
-    count_summary = df[count_columns].describe()
-
-    print("\nNumber of readings per variable:")
-    print(count_summary.to_string())
-
-    count_summary.to_csv(
-        DIAGNOSTICS_DIR / "json_reading_count_summary.csv"
-    )
-
-timestamp_summary = []
-
-for sensor_id, group in df.groupby("sensorid", dropna=False):
-    times = group["Carbon dioxide time"].dropna()
-    unique_times = times.nunique()
-
-    timestamp_summary.append({
-        "sensorid": sensor_id,
-        "rows": len(group),
-        "missing_timestamps": group["Carbon dioxide time"].isna().sum(),
-        "unique_timestamps": unique_times,
-        "repeated_timestamps": len(times) - unique_times,
-        "first_timestamp": times.min() if len(times) else pd.NaT,
-        "last_timestamp": times.max() if len(times) else pd.NaT,
-        "timestamp_span_hours": (
-            (times.max() - times.min()).total_seconds() / 3600
-            if unique_times > 1
-            else 0
-        )
-    })
-
-timestamp_summary = pd.DataFrame(timestamp_summary)
-
-print("\nPer-sensor timestamp summary:")
-print(timestamp_summary.to_string(index=False))
-
-timestamp_summary.to_csv(
-    DIAGNOSTICS_DIR / "timestamp_summary.csv",
-    index=False
-)
-
-
-# ==================================================
-# 7. COMPARE SENSOR AND DATABASE TIMESTAMPS
-# ==================================================
-
-df["createdate_parsed"] = pd.to_datetime(
-    df["createdate"],
-    errors="coerce",
-    utc=True,
-    format="mixed"
-)
-
-df["co2_timestamp_minus_createdate_minutes"] = (
-    df["Carbon dioxide time"] - df["createdate_parsed"]
-).dt.total_seconds() / 60
-
-print("\nCO2 timestamp minus createdate, in minutes:")
-print(
-    df["co2_timestamp_minus_createdate_minutes"]
-    .describe()
-    .to_string()
-)
-
+# Create the primary timestamp before using it elsewhere.
 df["timestamp"] = df["Carbon dioxide time"]
 
-timestamp_issues = df[
-    df["timestamp"].isna()
-    | df["createdate_parsed"].isna()
-    | df["co2_timestamp_minus_createdate_minutes"].abs().gt(60)
-].copy()
+print("Timestamp columns converted:", len(time_columns))
+print("Valid CO2 timestamps:", int(df["timestamp"].notna().sum()))
+print("Missing CO2 timestamps:", int(df["timestamp"].isna().sum()))
+
+
+# ============================================================
+# 5. CONVERT MEASUREMENTS TO NUMERIC
+# ============================================================
+
+print("\n" + "=" * 65)
+print("STEP 4: CONVERTING MEASUREMENTS")
+print("=" * 65)
+
+metadata_columns = {
+    "id",
+    "sensorid",
+    "devicetype",
+    "status",
+    "processing_errors",
+    "createdate",
+    "processdate",
+    "source_row",
+    "createdate_parsed",
+    "timestamp",
+}
+
+for column in df.columns:
+    if (
+        column not in metadata_columns
+        and not column.endswith(" time")
+        and not column.endswith(" number_of_values")
+    ):
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+if "total_json_readings" not in df.columns:
+    df["total_json_readings"] = 0
+
+df["json_has_no_readings"] = (
+    pd.to_numeric(df["total_json_readings"], errors="coerce")
+    .fillna(0)
+    .eq(0)
+)
+
+
+# ============================================================
+# 6. CHECK MISSING AND IMPLAUSIBLE VALUES
+# ============================================================
+
+print("\n" + "=" * 65)
+print("STEP 5: CHECKING MEASUREMENT QUALITY")
+print("=" * 65)
+
+# Broad screening ranges, not manufacturer-specific specifications.
+# Flag values instead of deleting records automatically.
+valid_ranges = {
+    "Carbon dioxide": (250, 10000),
+    "Temperature": (-20, 60),
+    "Humidity": (0, 100),
+    "Pressure": (300, 1200),
+    "Battery": (0, 6),
+    "Formaldehyde": (0, 1000),
+    "Light Volatile Organic Compounds": (0, 10000),
+    "Particulate matter 1": (0, 2000),
+    "Particulate matter 2.5": (0, 2000),
+    "Particulate matter 4": (0, 2000),
+    "Particulate matter 10": (0, 2000),
+}
+
+measurement_columns = [
+    column for column in valid_ranges
+    if column in df.columns
+]
+
+missing_rows = []
+
+for column in measurement_columns:
+    lower, upper = valid_ranges[column]
+
+    df[f"{column}_missing"] = df[column].isna()
+
+    df[f"{column}_out_of_range"] = (
+        df[column].notna()
+        & ~df[column].between(lower, upper)
+    )
+
+    # Retain the original measurement; mask only in the screened column.
+    df[f"{column}_clean"] = df[column].mask(
+        df[f"{column}_out_of_range"]
+    )
+
+    missing_rows.append({
+        "measurement": column,
+        "missing_count": int(df[column].isna().sum()),
+        "missing_percentage": float(df[column].isna().mean() * 100),
+        "out_of_range_count": int(
+            df[f"{column}_out_of_range"].sum()
+        ),
+    })
+
+missing_summary = pd.DataFrame(missing_rows)
+
+missing_summary.to_csv(
+    DIAGNOSTICS_DIR / "missing_and_invalid_values.csv",
+    index=False,
+)
+
+print(missing_summary.to_string(index=False))
+
+
+# ============================================================
+# 7. CHECK TIMESTAMP RELIABILITY
+# ============================================================
+
+print("\n" + "=" * 65)
+print("STEP 6: CHECKING TIMESTAMP RELIABILITY")
+print("=" * 65)
+
+# Both timestamp columns are timezone-aware UTC.
+df["timestamp_difference_minutes"] = (
+    df["timestamp"] - df["createdate_parsed"]
+).dt.total_seconds() / 60
+
+df["timestamp_missing"] = df["timestamp"].isna()
+df["createdate_missing"] = df["createdate_parsed"].isna()
+
+df["timestamp_mismatch_over_60min"] = (
+    df["timestamp_difference_minutes"].abs() > 60
+)
+
+timestamp_summary = (
+    df.groupby("sensorid", dropna=False)
+    .agg(
+        rows=("source_row", "size"),
+        unique_measurement_timestamps=("timestamp", "nunique"),
+        missing_measurement_timestamps=("timestamp_missing", "sum"),
+        missing_creation_timestamps=("createdate_missing", "sum"),
+        mismatches_over_60min=("timestamp_mismatch_over_60min", "sum"),
+        median_difference_minutes=("timestamp_difference_minutes", "median"),
+    )
+    .reset_index()
+)
+
+timestamp_summary.to_csv(
+    DIAGNOSTICS_DIR / "timestamp_quality_summary.csv",
+    index=False,
+)
+
+timestamp_issues = df.loc[
+    df["timestamp_missing"]
+    | df["createdate_missing"]
+    | df["timestamp_mismatch_over_60min"],
+    [
+        "source_row",
+        "sensorid",
+        "createdate",
+        "createdate_parsed",
+        "timestamp",
+        "timestamp_difference_minutes",
+        "timestamp_missing",
+        "createdate_missing",
+        "timestamp_mismatch_over_60min",
+    ],
+]
 
 timestamp_issues.to_csv(
     DIAGNOSTICS_DIR / "timestamp_issues.csv",
-    index=False
+    index=False,
 )
 
-print("\nMissing or mismatched timestamp records:", len(timestamp_issues))
+print(timestamp_summary.to_string(index=False))
+print("Rows flagged for timestamp review:", len(timestamp_issues))
 
 
-# ==================================================
-# 8. CONVERT MEASUREMENTS TO NUMERIC
-# ==================================================
+# ============================================================
+# 8. FLAG EXACT DUPLICATE RECORDS
+# ============================================================
 
-measurement_columns = [
-    "Battery",
-    "Carbon dioxide",
-    "Humidity",
-    "Formaldehyde",
-    "Pressure",
-    "Temperature",
-    "Light Volatile Organic Compounds",
-    "Particulate matter 1",
-    "Particulate matter 4",
-    "Particulate matter 2.5",
-    "Particulate matter 10"
+print("\n" + "=" * 65)
+print("STEP 7: CHECKING EXACT DUPLICATES")
+print("=" * 65)
+
+duplicate_check_columns = [
+    column for column in df.columns
+    if column != "source_row"
 ]
 
-for column in measurement_columns:
-    if column in df.columns:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
+df["exact_duplicate_record"] = df.duplicated(
+    subset=duplicate_check_columns,
+    keep="first",
+)
+
+exact_duplicates = df.loc[df["exact_duplicate_record"]].copy()
+
+exact_duplicates.to_csv(
+    DIAGNOSTICS_DIR / "exact_duplicate_records.csv",
+    index=False,
+)
+
+print("Exact duplicate records:", int(df["exact_duplicate_record"].sum()))
 
 
-# ==================================================
-# 9. FLAG OUT-OF-RANGE MEASUREMENTS
-# ==================================================
+# ============================================================
+# 9. FLAG REPEATED TIMESTAMPS AND READINGS
+# ============================================================
 
-valid_ranges = {
-    "Battery": (0, 6),
-    "Carbon dioxide": (0, 10000),
-    "Humidity": (0, 100),
-    "Formaldehyde": (0, 10000),
-    "Pressure": (800, 1200),
-    "Temperature": (-30, 60),
-    "Light Volatile Organic Compounds": (0, 100000),
-    "Particulate matter 1": (0, 2000),
-    "Particulate matter 4": (0, 2000),
-    "Particulate matter 2.5": (0, 2000),
-    "Particulate matter 10": (0, 2000)
-}
+print("\n" + "=" * 65)
+print("STEP 8: CHECKING REPEATED SENSOR READINGS")
+print("=" * 65)
 
-range_diagnostics = []
-
-for column, (minimum, maximum) in valid_ranges.items():
-    if column not in df.columns:
-        continue
-
-    invalid = df[column].notna() & (
-        (df[column] < minimum)
-        | (df[column] > maximum)
+df["repeated_sensor_timestamp"] = (
+    df["sensorid"].notna()
+    & df["timestamp"].notna()
+    & df.duplicated(
+        subset=["sensorid", "timestamp"],
+        keep=False,
     )
-
-    count = int(invalid.sum())
-
-    print(f"{column}: {count} out-of-range readings")
-
-    range_diagnostics.append({
-        "variable": column,
-        "minimum_allowed": minimum,
-        "maximum_allowed": maximum,
-        "out_of_range_count": count
-    })
-
-    df.loc[invalid, column] = float("nan")
-
-pd.DataFrame(range_diagnostics).to_csv(
-    DIAGNOSTICS_DIR / "range_diagnostics.csv",
-    index=False
 )
 
-
-# ==================================================
-# 10. MISSING VALUE SUMMARY
-# ==================================================
-
-missing_summary = pd.DataFrame({
-    "column": df.columns,
-    "missing_count": [
-        int(df[column].isna().sum()) for column in df.columns
-    ],
-    "missing_percent": [
-        df[column].isna().mean() * 100 for column in df.columns
-    ]
-})
-
-print("\nMissing values:")
-print(
-    missing_summary[missing_summary["missing_count"] > 0]
-    .to_string(index=False)
-)
-
-missing_summary.to_csv(
-    DIAGNOSTICS_DIR / "missing_values_summary.csv",
-    index=False
-)
-
-
-# ==================================================
-# 11. SORT AND FIND REPEATED TIMESTAMPS
-# ==================================================
-
-df = df.sort_values(
-    ["sensorid", "timestamp", "createdate_parsed"],
-    na_position="last"
-).reset_index(drop=True)
-
-display_columns = [
+comparison_columns = [
     column for column in [
-        "sensorid",
-        "createdate",
-        "timestamp",
         "Carbon dioxide",
         "Temperature",
-        "Humidity"
+        "Humidity",
+        "Pressure",
+        "Battery",
     ]
     if column in df.columns
 ]
 
-print("\nFirst 10 sorted readings:")
-print(df[display_columns].head(10).to_string(index=False))
+df = df.sort_values(
+    ["sensorid", "createdate_parsed", "source_row"],
+    na_position="last",
+).reset_index(drop=True)
 
-repeated = df.duplicated(
-    subset=["sensorid", "timestamp"],
-    keep=False
+df["adjacent_identical_readings"] = False
+
+if comparison_columns:
+    previous_values = (
+        df.groupby("sensorid", dropna=False)[comparison_columns]
+        .shift(1)
+    )
+
+    current_values = df[comparison_columns]
+
+    comparable = (
+        current_values.notna() & previous_values.notna()
+    ).any(axis=1)
+
+    equal_values = (
+        current_values.eq(previous_values)
+        | (current_values.isna() & previous_values.isna())
+    )
+
+    identical = equal_values.all(axis=1)
+
+    df["adjacent_identical_readings"] = comparable & identical
+
+repeat_summary = (
+    df.groupby("sensorid", dropna=False)
+    .agg(
+        rows=("source_row", "size"),
+        unique_CO2_timestamps=("timestamp", "nunique"),
+        unique_CO2_values=("Carbon dioxide", "nunique"),
+        repeated_timestamp_rows=("repeated_sensor_timestamp", "sum"),
+        adjacent_identical_readings=("adjacent_identical_readings", "sum"),
+    )
+    .reset_index()
 )
 
-print("\nRows sharing a sensor ID and timestamp:", int(repeated.sum()))
-
-df.loc[repeated].to_csv(
-    DIAGNOSTICS_DIR / "repeated_sensor_timestamps.csv",
-    index=False
+repeat_summary.to_csv(
+    DIAGNOSTICS_DIR / "repeated_reading_summary.csv",
+    index=False,
 )
 
+repeated_rows = df.loc[
+    df["repeated_sensor_timestamp"]
+    | df["adjacent_identical_readings"]
+].copy()
 
-# ==================================================
-# 12. EXPORT CLEANED DATA
-# ==================================================
+repeated_rows.to_csv(
+    DIAGNOSTICS_DIR / "repeated_reading_records.csv",
+    index=False,
+)
 
-OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+print(repeat_summary.to_string(index=False))
 
-df.to_csv(OUTPUT_FILE, index=False)
+
+# ============================================================
+# 10. SAVE CLEANED DATA AND SUMMARY
+# ============================================================
 
 print("\n" + "=" * 65)
-print("DATA CLEANING COMPLETE")
+print("STEP 9: SAVING CLEANED DATA")
 print("=" * 65)
-print("Final dataset shape:", df.shape)
-print("Cleaned dataset:", OUTPUT_FILE)
-print("Diagnostics saved in:", DIAGNOSTICS_DIR)
+
+df = df.sort_values(
+    ["sensorid", "timestamp", "createdate_parsed", "source_row"],
+    na_position="last",
+).reset_index(drop=True)
+
+cleaned_file = OUTPUT_DIR / "cleaned_sensor_data.csv"
+df.to_csv(cleaned_file, index=False)
+
+run_summary = pd.DataFrame([{
+    "input_file": DATA_FILE.name,
+    "rows_loaded": len(df),
+    "number_of_sensors": df["sensorid"].nunique(),
+    "missing_CO2_timestamps": int(df["timestamp_missing"].sum()),
+    "timestamp_mismatches_over_60min": int(
+        df["timestamp_mismatch_over_60min"].sum()
+    ),
+    "exact_duplicate_records": int(df["exact_duplicate_record"].sum()),
+    "repeated_timestamp_rows": int(df["repeated_sensor_timestamp"].sum()),
+    "adjacent_identical_readings": int(
+        df["adjacent_identical_readings"].sum()
+    ),
+    "cleaned_file": str(cleaned_file),
+}])
+
+run_summary.to_csv(
+    DIAGNOSTICS_DIR / "cleaning_run_summary.csv",
+    index=False,
+)
+
+print("Cleaned dataset saved to:", cleaned_file)
+print("Diagnostic reports saved to:", DIAGNOSTICS_DIR)
+print("\nRun summary:")
+print(run_summary.to_string(index=False))
+
+print("\nDATA CLEANING COMPLETE")
