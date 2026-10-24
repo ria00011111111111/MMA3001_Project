@@ -1,0 +1,199 @@
+
+from pathlib import Path
+import pandas as pd
+import zipfile
+
+# --------------------------------------------------
+# 1. PATHS
+# --------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+DATA_DIR = PROJECT_ROOT / "data"
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "occupancy_environment_matching"
+
+ENV_FILE = (
+    PROJECT_ROOT
+    / "outputs"
+    / "environmental_data_audit"
+    / "5EnvSensor_MayToDec2024_180kRows_readings.csv"
+)
+
+OCCUPANCY_ZIP = (
+    DATA_DIR / "5occupancySensor_MayToDec2024_9MRows (1).zip"
+)
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Use the strongest environmental time series identified
+TARGET_SENSOR = "6012002000326"
+
+INTERVAL = "5min"
+
+# --------------------------------------------------
+# 2. LOAD ENVIRONMENTAL MEASUREMENTS
+# --------------------------------------------------
+
+print("Loading environmental measurements...")
+
+env = pd.read_csv(
+    ENV_FILE,
+    usecols=["sensorid", "timestamp_utc", "variable", "value"],
+    low_memory=False,
+)
+
+env["sensorid"] = env["sensorid"].astype(str)
+env["timestamp_utc"] = pd.to_datetime(
+    env["timestamp_utc"], utc=True, errors="coerce"
+)
+env["value"] = pd.to_numeric(env["value"], errors="coerce")
+
+env = env[
+    (env["sensorid"] == TARGET_SENSOR)
+    & env["timestamp_utc"].notna()
+    & env["value"].notna()
+].copy()
+
+# Remove repeated copies of the same measurement
+env = env.drop_duplicates(
+    subset=["sensorid", "timestamp_utc", "variable"]
+)
+
+# Aggregate environmental measurements to five-minute intervals
+env["interval"] = env["timestamp_utc"].dt.floor(INTERVAL)
+
+env_5min = (
+    env.groupby(["interval", "variable"])["value"]
+    .mean()
+    .unstack("variable")
+)
+
+env_5min.index = pd.to_datetime(env_5min.index, utc=True)
+
+print(f"Environmental intervals: {len(env_5min):,}")
+print(f"Environmental range: {env_5min.index.min()} to "
+      f"{env_5min.index.max()}")
+
+# --------------------------------------------------
+# 3. LOAD OCCUPANCY DATA IN CHUNKS
+# --------------------------------------------------
+
+print("\nReading occupancy data from ZIP...")
+
+if not OCCUPANCY_ZIP.exists():
+    raise FileNotFoundError(f"Occupancy ZIP not found: {OCCUPANCY_ZIP}")
+
+occupancy_chunks = []
+
+with zipfile.ZipFile(OCCUPANCY_ZIP) as archive:
+    csv_files = [
+        name for name in archive.namelist()
+        if name.lower().endswith(".csv")
+    ]
+
+    if not csv_files:
+        raise FileNotFoundError("No CSV file found in occupancy ZIP.")
+
+    with archive.open(csv_files[0]) as file:
+        for chunk in pd.read_csv(
+            file,
+            usecols=[
+                "floorspaceid",
+                "occupancystatus",
+                "collecteddate",
+            ],
+            chunksize=250_000,
+        ):
+            chunk["collecteddate"] = pd.to_datetime(
+                chunk["collecteddate"],
+                utc=True,
+                errors="coerce",
+            )
+
+            chunk = chunk.dropna(
+                subset=["floorspaceid", "collecteddate",
+                        "occupancystatus"]
+            )
+
+            chunk["interval"] = (
+                chunk["collecteddate"].dt.floor(INTERVAL)
+            )
+
+            # Keep unique floor-space / interval / state observations
+            chunk = chunk.drop_duplicates(
+                subset=[
+                    "floorspaceid",
+                    "interval",
+                    "occupancystatus",
+                ]
+            )
+
+            occupancy_chunks.append(
+                chunk[
+                    ["floorspaceid", "interval", "occupancystatus"]
+                ]
+            )
+
+            print(
+                f"Processed {sum(len(c) for c in occupancy_chunks):,} "
+                "occupancy records..."
+            )
+
+occupancy = pd.concat(occupancy_chunks, ignore_index=True)
+
+# One row per floor space and interval.
+# If multiple states occur in an interval, retain the latest
+# state based on the original collecteddate.
+# Reload the relevant columns in chunks with timestamps to do this.
+# The aggregation below counts unique occupied intervals and states;
+# it does not assume a floor-space-to-room mapping.
+
+occupancy = occupancy.drop_duplicates(
+    subset=["floorspaceid", "interval", "occupancystatus"]
+)
+
+print(f"\nOccupancy interval-state records: {len(occupancy):,}")
+
+# --------------------------------------------------
+# 4. COMPARE TIME INTERVALS
+# --------------------------------------------------
+
+print("\nCalculating timestamp overlap...")
+
+env_intervals = set(env_5min.index)
+results = []
+
+for floor_id, group in occupancy.groupby("floorspaceid"):
+    floor_intervals = set(
+        pd.to_datetime(group["interval"], utc=True)
+    )
+
+    overlap = env_intervals.intersection(floor_intervals)
+
+    results.append({
+        "floorspaceid": floor_id,
+        "occupancy_interval_state_rows": len(group),
+        "unique_occupancy_intervals": len(floor_intervals),
+        "environmental_intervals": len(env_intervals),
+        "overlapping_5min_intervals": len(overlap),
+        "overlap_percent_of_occupancy_intervals": (
+            100 * len(overlap) / len(floor_intervals)
+            if floor_intervals else 0
+        ),
+        "room_match_verified": False,
+    })
+
+summary = pd.DataFrame(results)
+
+summary_path = OUTPUT_DIR / "timestamp_overlap_summary.csv"
+summary.to_csv(summary_path, index=False)
+
+print("\nOVERLAP SUMMARY")
+print(summary.to_string(index=False))
+
+print(f"\nSaved summary to:\n{summary_path}")
+print(
+    "\nIMPORTANT: Temporal overlap does not prove that the "
+    "environmental sensor and occupancy floor space are in the "
+    "same physical room."
+)
