@@ -1,0 +1,709 @@
+
+"""
+MMA3001 - FILE 06_2: OCCUPANCY DATA AUDIT
+
+Purpose:
+1. Audit every row in the large occupancy sensor dataset.
+2. Establish actual timestamp coverage and data quality.
+3. Summarise occupancy states and headcount distributions.
+4. Identify unique devices and floor spaces.
+5. Investigate missing values and duplicate records.
+6. Produce reports to support environmental sensor matching.
+
+This script does not modify the original data or train a model.
+
+Important:
+- Data is processed in chunks to limit memory usage.
+- Duplicate row checks are exact within each chunk, not globally.
+- Timestamp values are parsed as UTC for consistent comparison.
+"""
+
+from pathlib import Path
+from zipfile import ZipFile
+from collections import Counter, defaultdict
+import json
+
+import pandas as pd
+
+
+# ============================================================
+# 1. PATHS AND SETTINGS
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = PROJECT_ROOT / "data"
+
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "occupancy_data_audit"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+ZIP_PATTERN = "5occupancySensor_MayToDec2024_9MRows*.zip"
+CHUNK_SIZE = 200_000
+
+TIMESTAMP_COLUMNS = [
+    "collecteddate",
+    "occupancystatuschangedate"
+]
+
+REQUIRED_COLUMNS = [
+    "id",
+    "deviceid",
+    "floorspaceid",
+    "occupancystatus",
+    "headcount",
+    "collecteddate",
+    "occupancystatuschangedate",
+    "previousoccupancystatus"
+]
+
+
+# ============================================================
+# 2. FIND THE OCCUPANCY ARCHIVE
+# ============================================================
+
+def find_occupancy_archive():
+    """Locate the occupancy ZIP archive."""
+
+    zip_files = sorted(DATA_DIR.rglob(ZIP_PATTERN))
+
+    if not zip_files:
+        raise FileNotFoundError(
+            f"No occupancy ZIP matching {ZIP_PATTERN!r} "
+            f"was found under {DATA_DIR}"
+        )
+
+    if len(zip_files) > 1:
+        print("Multiple matching ZIP files found:")
+        for path in zip_files:
+            print(f"  {path}")
+
+        print("\nUsing the first archive. Check that this is intended.")
+
+    return zip_files[0]
+
+
+def find_csv_member(archive):
+    """Find the CSV file inside the ZIP archive."""
+
+    csv_members = [
+        name for name in archive.namelist()
+        if name.lower().endswith(".csv")
+    ]
+
+    if not csv_members:
+        raise FileNotFoundError(
+            "No CSV file was found inside the occupancy ZIP."
+        )
+
+    if len(csv_members) > 1:
+        print("Multiple CSV members found:")
+        for name in csv_members:
+            print(f"  {name}")
+
+        print("Using the first CSV member.")
+
+    return csv_members[0]
+
+
+# ============================================================
+# 3. INITIALISE AUDIT COUNTERS
+# ============================================================
+
+def initialise_audit():
+    """Create dictionaries and counters for the audit."""
+
+    return {
+        "total_rows": 0,
+        "missing_values": Counter(),
+        "occupancy_states": Counter(),
+        "previous_states": Counter(),
+        "devices": defaultdict(lambda: {
+            "rows": 0,
+            "first_timestamp": None,
+            "last_timestamp": None,
+            "states": Counter(),
+            "headcount_sum": 0,
+            "headcount_valid": 0
+        }),
+        "floor_spaces": defaultdict(lambda: {
+            "rows": 0,
+            "first_timestamp": None,
+            "last_timestamp": None,
+            "states": Counter(),
+            "headcount_sum": 0,
+            "headcount_valid": 0
+        }),
+        "device_floor_spaces": defaultdict(lambda: {
+            "rows": 0,
+            "first_timestamp": None,
+            "last_timestamp": None,
+            "states": Counter(),
+            "headcount_sum": 0,
+            "headcount_valid": 0
+        }),
+        "headcount_values": Counter(),
+        "headcount_sum": 0,
+        "headcount_valid": 0,
+        "headcount_missing": 0,
+        "headcount_negative": 0,
+        "headcount_zero": 0,
+        "headcount_positive": 0,
+        "timestamp_stats": {
+            column: {
+                "valid": 0,
+                "invalid": 0,
+                "earliest": None,
+                "latest": None
+            }
+            for column in TIMESTAMP_COLUMNS
+        },
+        "duplicate_rows_within_chunks": 0,
+        "duplicate_ids_within_chunks": 0,
+        "chunks_processed": 0,
+        "unexpected_columns": [],
+        "missing_columns": []
+    }
+
+
+# ============================================================
+# 4. UPDATE TIMESTAMP STATISTICS
+# ============================================================
+
+def update_timestamp_stats(df, audit):
+    """Parse timestamps and track their date ranges."""
+
+    parsed_timestamps = {}
+
+    for column in TIMESTAMP_COLUMNS:
+        if column not in df.columns:
+            continue
+
+        parsed = pd.to_datetime(
+            df[column],
+            errors="coerce",
+            utc=True
+        )
+
+        stats = audit["timestamp_stats"][column]
+
+        valid = parsed.dropna()
+        stats["valid"] += int(valid.size)
+        stats["invalid"] += int(parsed.isna().sum())
+
+        if not valid.empty:
+            earliest = valid.min()
+            latest = valid.max()
+
+            if (
+                stats["earliest"] is None
+                or earliest < stats["earliest"]
+            ):
+                stats["earliest"] = earliest
+
+            if (
+                stats["latest"] is None
+                or latest > stats["latest"]
+            ):
+                stats["latest"] = latest
+
+        parsed_timestamps[column] = parsed
+
+    return parsed_timestamps
+
+
+# ============================================================
+# 5. UPDATE DEVICE AND FLOOR-SPACE SUMMARIES
+# ============================================================
+
+def update_group_summary(
+    summary,
+    key,
+    timestamps,
+    states,
+    headcounts
+):
+    """Update statistics for a device, space or device-space pair."""
+
+    if pd.isna(key) or str(key).strip() == "":
+        return
+
+    key = str(key)
+    record = summary[key]
+
+    record["rows"] += len(states)
+
+    valid_times = timestamps.dropna()
+
+    if not valid_times.empty:
+        earliest = valid_times.min()
+        latest = valid_times.max()
+
+        if (
+            record["first_timestamp"] is None
+            or earliest < record["first_timestamp"]
+        ):
+            record["first_timestamp"] = earliest
+
+        if (
+            record["last_timestamp"] is None
+            or latest > record["last_timestamp"]
+        ):
+            record["last_timestamp"] = latest
+
+    record["states"].update(
+        states.fillna("<MISSING>").astype(str).tolist()
+    )
+
+    valid_counts = pd.to_numeric(
+        headcounts,
+        errors="coerce"
+    ).dropna()
+
+    record["headcount_sum"] += valid_counts.sum()
+    record["headcount_valid"] += int(valid_counts.size)
+
+
+# ============================================================
+# 6. PROCESS EACH CHUNK
+# ============================================================
+
+def process_chunk(df, audit):
+    """Update full-dataset statistics for one chunk."""
+
+    audit["chunks_processed"] += 1
+    audit["total_rows"] += len(df)
+
+    # Record column structure from the first chunk.
+    if audit["chunks_processed"] == 1:
+        audit["missing_columns"] = [
+            column for column in REQUIRED_COLUMNS
+            if column not in df.columns
+        ]
+
+        audit["unexpected_columns"] = [
+            column for column in df.columns
+            if column not in REQUIRED_COLUMNS
+        ]
+
+        print("\nColumns found:", list(df.columns))
+
+        if audit["missing_columns"]:
+            raise ValueError(
+                "Required columns are missing: "
+                + ", ".join(audit["missing_columns"])
+            )
+
+    # Missing values across every chunk.
+    audit["missing_values"].update(
+        df.isna().sum().to_dict()
+    )
+
+    # Exact duplicate rows within this chunk only.
+    audit["duplicate_rows_within_chunks"] += int(
+        df.duplicated().sum()
+    )
+
+    # Duplicate IDs within this chunk only.
+    audit["duplicate_ids_within_chunks"] += int(
+        df["id"].duplicated().sum()
+    )
+
+    # Occupancy states.
+    states = df["occupancystatus"].fillna("<MISSING>").astype(str)
+    previous_states = (
+        df["previousoccupancystatus"]
+        .fillna("<MISSING>")
+        .astype(str)
+    )
+
+    audit["occupancy_states"].update(states.tolist())
+    audit["previous_states"].update(previous_states.tolist())
+
+    # Headcount statistics.
+    headcounts = pd.to_numeric(
+        df["headcount"],
+        errors="coerce"
+    )
+
+    valid_headcounts = headcounts.dropna()
+
+    audit["headcount_valid"] += int(valid_headcounts.size)
+    audit["headcount_missing"] += int(headcounts.isna().sum())
+    audit["headcount_sum"] += valid_headcounts.sum()
+
+    audit["headcount_negative"] += int(
+        (valid_headcounts < 0).sum()
+    )
+    audit["headcount_zero"] += int(
+        (valid_headcounts == 0).sum()
+    )
+    audit["headcount_positive"] += int(
+        (valid_headcounts > 0).sum()
+    )
+
+    audit["headcount_values"].update(
+        valid_headcounts.value_counts().to_dict()
+    )
+
+    # Parse both timestamp columns.
+    parsed = update_timestamp_stats(df, audit)
+
+    # Use collecteddate as the primary observation time.
+    if "collecteddate" in parsed:
+        primary_time = parsed["collecteddate"]
+    else:
+        primary_time = pd.Series(
+            pd.NaT,
+            index=df.index,
+            dtype="datetime64[ns, UTC]"
+        )
+
+    # Per-device, per-floor-space and device-space summaries.
+    for device, indices in df.groupby(
+        "deviceid",
+        dropna=False,
+        sort=False
+    ).groups.items():
+        update_group_summary(
+            audit["devices"],
+            device,
+            primary_time.loc[indices],
+            states.loc[indices],
+            headcounts.loc[indices]
+        )
+
+    for space, indices in df.groupby(
+        "floorspaceid",
+        dropna=False,
+        sort=False
+    ).groups.items():
+        update_group_summary(
+            audit["floor_spaces"],
+            space,
+            primary_time.loc[indices],
+            states.loc[indices],
+            headcounts.loc[indices]
+        )
+
+    for (device, space), indices in df.groupby(
+        ["deviceid", "floorspaceid"],
+        dropna=False,
+        sort=False
+    ).groups.items():
+        key = f"{device} | {space}"
+
+        update_group_summary(
+            audit["device_floor_spaces"],
+            key,
+            primary_time.loc[indices],
+            states.loc[indices],
+            headcounts.loc[indices]
+        )
+
+
+# ============================================================
+# 7. SAVE REPORTS
+# ============================================================
+
+def save_counter(counter, name, value_name="count"):
+    """Save a counter as a CSV report."""
+
+    rows = [
+        {name: key, value_name: value}
+        for key, value in counter.items()
+    ]
+
+    result = pd.DataFrame(rows)
+
+    if not result.empty:
+        result = result.sort_values(
+            value_name,
+            ascending=False
+        )
+
+        total = result[value_name].sum()
+
+        result["percentage"] = (
+            result[value_name] / total * 100
+            if total else 0
+        ).round(4)
+
+    result.to_csv(
+        OUTPUT_DIR / f"{name}_counts.csv",
+        index=False
+    )
+
+    return result
+
+
+def summary_to_dataframe(summary, group_name):
+    """Convert group statistics into a report."""
+
+    rows = []
+
+    for key, record in summary.items():
+        rows.append({
+            group_name: key,
+            "rows": record["rows"],
+            "first_timestamp_utc": record["first_timestamp"],
+            "last_timestamp_utc": record["last_timestamp"],
+            "currently_occupied_rows": record["states"].get(
+                "CurrentlyOccupied", 0
+            ),
+            "recently_occupied_rows": record["states"].get(
+                "RecentlyOccupied", 0
+            ),
+            "not_occupied_rows": record["states"].get(
+                "NotOccupied", 0
+            ),
+            "other_or_missing_state_rows": sum(
+                count for state, count in record["states"].items()
+                if state not in {
+                    "CurrentlyOccupied",
+                    "RecentlyOccupied",
+                    "NotOccupied"
+                }
+            ),
+            "headcount_valid_rows": record["headcount_valid"],
+            "headcount_mean": (
+                record["headcount_sum"] / record["headcount_valid"]
+                if record["headcount_valid"] else None
+            )
+        })
+
+    return pd.DataFrame(rows)
+
+
+def save_reports(audit, archive_path, member_name):
+    """Save all final audit reports."""
+
+    total = audit["total_rows"]
+
+    # Overall summary.
+    summary_rows = [
+        {"metric": "source_zip", "value": str(archive_path)},
+        {"metric": "source_csv", "value": member_name},
+        {"metric": "total_rows", "value": total},
+        {"metric": "chunks_processed", "value": audit["chunks_processed"]},
+        {"metric": "unique_devices", "value": len(audit["devices"])},
+        {"metric": "unique_floor_spaces", "value": len(audit["floor_spaces"])},
+        {
+            "metric": "unique_device_floor_space_pairs",
+            "value": len(audit["device_floor_spaces"])
+        },
+        {
+            "metric": "headcount_valid_rows",
+            "value": audit["headcount_valid"]
+        },
+        {
+            "metric": "headcount_missing_or_unparseable",
+            "value": audit["headcount_missing"]
+        },
+        {
+            "metric": "headcount_mean",
+            "value": (
+                audit["headcount_sum"] / audit["headcount_valid"]
+                if audit["headcount_valid"] else None
+            )
+        },
+        {
+            "metric": "negative_headcount_rows",
+            "value": audit["headcount_negative"]
+        },
+        {"metric": "zero_headcount_rows", "value": audit["headcount_zero"]},
+        {
+            "metric": "positive_headcount_rows",
+            "value": audit["headcount_positive"]
+        },
+        {
+            "metric": "duplicate_rows_within_chunks",
+            "value": audit["duplicate_rows_within_chunks"]
+        },
+        {
+            "metric": "duplicate_ids_within_chunks",
+            "value": audit["duplicate_ids_within_chunks"]
+        }
+    ]
+
+    pd.DataFrame(summary_rows).to_csv(
+        OUTPUT_DIR / "occupancy_overall_summary.csv",
+        index=False
+    )
+
+    # Occupancy state counts.
+    save_counter(
+        audit["occupancy_states"],
+        "occupancy_state"
+    )
+
+    save_counter(
+        audit["previous_states"],
+        "previous_occupancy_state"
+    )
+
+    # Headcount distribution.
+    save_counter(
+        audit["headcount_values"],
+        "headcount_value",
+        value_name="count"
+    )
+
+    # Missing values.
+    missing_rows = []
+
+    for column in REQUIRED_COLUMNS:
+        count = audit["missing_values"].get(column, 0)
+
+        missing_rows.append({
+            "column": column,
+            "missing_count": count,
+            "missing_percentage": (
+                count / total * 100 if total else 0
+            )
+        })
+
+    pd.DataFrame(missing_rows).to_csv(
+        OUTPUT_DIR / "occupancy_missing_values.csv",
+        index=False
+    )
+
+    # Timestamp coverage.
+    timestamp_rows = []
+
+    for column, stats in audit["timestamp_stats"].items():
+        timestamp_rows.append({
+            "timestamp_column": column,
+            "valid_timestamps": stats["valid"],
+            "invalid_timestamps": stats["invalid"],
+            "earliest_utc": stats["earliest"],
+            "latest_utc": stats["latest"]
+        })
+
+    pd.DataFrame(timestamp_rows).to_csv(
+        OUTPUT_DIR / "occupancy_timestamp_summary.csv",
+        index=False
+    )
+
+    # Per-device, per-space and combined summaries.
+    reports = [
+        ("occupancy_device_summary.csv", audit["devices"], "deviceid"),
+        (
+            "occupancy_floorspace_summary.csv",
+            audit["floor_spaces"],
+            "floorspaceid"
+        ),
+        (
+            "occupancy_device_floorspace_summary.csv",
+            audit["device_floor_spaces"],
+            "device_floorspace"
+        )
+    ]
+
+    for filename, summary, group_name in reports:
+        report = summary_to_dataframe(summary, group_name)
+
+        if not report.empty:
+            report = report.sort_values(
+                "rows",
+                ascending=False
+            )
+
+        report.to_csv(
+            OUTPUT_DIR / filename,
+            index=False
+        )
+
+    # File schema information.
+    schema_rows = [
+        {"column": column, "present": column not in audit["missing_columns"]}
+        for column in REQUIRED_COLUMNS
+    ]
+
+    pd.DataFrame(schema_rows).to_csv(
+        OUTPUT_DIR / "occupancy_schema_check.csv",
+        index=False
+    )
+
+
+# ============================================================
+# 8. MAIN
+# ============================================================
+
+def main():
+    print("=" * 75)
+    print("MMA3001 FILE 06_2: FULL OCCUPANCY DATA AUDIT")
+    print("=" * 75)
+
+    print(f"Project root: {PROJECT_ROOT}")
+    print(f"Data directory: {DATA_DIR}")
+    print(f"Output directory: {OUTPUT_DIR}")
+    print(f"Chunk size: {CHUNK_SIZE:,}")
+
+    archive_path = find_occupancy_archive()
+
+    print(f"\nArchive: {archive_path}")
+
+    audit = initialise_audit()
+
+    with ZipFile(archive_path, "r") as archive:
+        member_name = find_csv_member(archive)
+        info = archive.getinfo(member_name)
+
+        print(f"CSV member: {member_name}")
+        print(f"Uncompressed size: {info.file_size:,} bytes")
+
+        with archive.open(member_name, "r") as csv_file:
+            reader = pd.read_csv(
+                csv_file,
+                chunksize=CHUNK_SIZE,
+                low_memory=False
+            )
+
+            for chunk_number, chunk in enumerate(reader, start=1):
+                process_chunk(chunk, audit)
+
+                print(
+                    f"Processed chunk {chunk_number:,} | "
+                    f"Total rows: {audit['total_rows']:,}"
+                )
+
+    save_reports(audit, archive_path, member_name)
+
+    print("\n" + "=" * 75)
+    print("FULL OCCUPANCY AUDIT COMPLETE")
+    print("=" * 75)
+
+    print(f"Total rows audited: {audit['total_rows']:,}")
+    print(f"Chunks processed: {audit['chunks_processed']:,}")
+    print(f"Unique devices: {len(audit['devices']):,}")
+    print(f"Unique floor spaces: {len(audit['floor_spaces']):,}")
+
+    print("\nTimestamp coverage:")
+    for column, stats in audit["timestamp_stats"].items():
+        print(f"\n{column}")
+        print(f"  Valid: {stats['valid']:,}")
+        print(f"  Invalid: {stats['invalid']:,}")
+        print(f"  Earliest UTC: {stats['earliest']}")
+        print(f"  Latest UTC: {stats['latest']}")
+
+    print("\nOccupancy states:")
+    for state, count in audit["occupancy_states"].most_common():
+        percentage = (
+            count / audit["total_rows"] * 100
+            if audit["total_rows"] else 0
+        )
+        print(f"  {state}: {count:,} ({percentage:.2f}%)")
+
+    print("\nReports saved to:")
+    print(OUTPUT_DIR)
+
+    print(
+        "\nLIMITATIONS:"
+        "\n- Duplicate checks are within each chunk, not across the entire file."
+        "\n- Device and floor-space counts are based on non-empty IDs."
+        "\n- The audit does not establish the physical meaning of each state."
+        "\n- No environmental matching or model training occurs here."
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,499 @@
+
+"""
+MMA3001 - FILE 06-1: OCCUPANCY DATA INSPECTION
+
+Purpose:
+1. Locate occupancy sensor files in the data directory.
+2. Inspect file names, columns, data types and sample records.
+3. Identify possible timestamps, sensor IDs and occupancy measurements.
+4. Check date coverage, missing values and duplicate records.
+5. Save inspection reports for deciding whether the data can provide
+   occupancy ground truth.
+
+This script does not modify the original data or train a model.
+"""
+
+from pathlib import Path
+from zipfile import ZipFile
+import json
+import re
+
+import pandas as pd
+
+
+# ============================================================
+# 1. PATHS AND SETTINGS
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "occupancy_data_inspection"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+SUPPORTED_EXTENSIONS = {
+    ".csv", ".json", ".jsonl", ".ndjson"
+}
+
+MAX_SAMPLE_ROWS = 5
+
+print(f"Script location: {Path(__file__).resolve()}")
+print(f"Project root: {PROJECT_ROOT}")
+print(f"Data directory: {DATA_DIR}")
+print(f"Data directory exists: {DATA_DIR.exists()}")
+# ============================================================
+# 2. HELPER FUNCTIONS
+# ============================================================
+
+def normalise_column_name(column):
+    """Convert a column name into a searchable format."""
+    return re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        str(column).strip().lower()
+    ).strip("_")
+
+
+def is_occupancy_related(filename):
+    """Check whether a filename appears related to occupancy."""
+    name = Path(filename).name.lower()
+
+    keywords = [
+        "occupancy",
+        "occupancies",
+        "occupant",
+        "people_count",
+        "presence",
+        "motion",
+        "people_sensor"
+    ]
+
+    return any(keyword in name for keyword in keywords)
+
+
+def read_data_file(path):
+    """Read supported data files without modifying the source."""
+    suffix = Path(path).suffix.lower()
+
+    try:
+        if suffix == ".csv":
+            return pd.read_csv(path, low_memory=False)
+
+        if suffix in {".jsonl", ".ndjson"}:
+            return pd.read_json(path, lines=True)
+
+        if suffix == ".json":
+            try:
+                return pd.read_json(path)
+            except ValueError:
+                with open(path, "r", encoding="utf-8") as file:
+                    content = json.load(file)
+
+                if isinstance(content, list):
+                    return pd.DataFrame(content)
+
+                if isinstance(content, dict):
+                    # Handle common nested data structures.
+                    for key in [
+                        "data", "records", "results", "readings"
+                    ]:
+                        if isinstance(content.get(key), list):
+                            return pd.DataFrame(content[key])
+
+                    return pd.json_normalize(content)
+
+        return None
+
+    except Exception as error:
+        print(f"  Could not read {path}: {error}")
+        return None
+
+
+
+def identify_columns(df):
+    """Identify likely timestamps, IDs, occupancy labels and environmental variables."""
+
+    results = {
+        "timestamp_columns": [],
+        "sensor_id_columns": [],
+        "floorspace_id_columns": [],
+        "occupancy_candidate_columns": [],
+        "headcount_columns": [],
+        "environmental_columns": []
+    }
+
+    occupancy_terms = [
+        "occupancy", "occupied", "presence",
+        "people_count", "person_count",
+        "occupant_count", "num_people",
+        "people_present", "motion"
+    ]
+
+    environmental_terms = [
+        "co2", "temperature", "humidity",
+        "pressure", "voc", "pm25", "pm10"
+    ]
+
+    for column in df.columns:
+        name = normalise_column_name(column)
+
+        # Explicitly recognise the actual occupancy dataset timestamps.
+        if (
+            name in {
+                "collecteddate",
+                "occupancystatuschangedate",
+                "timestamp",
+                "time",
+                "datetime",
+                "date_time",
+                "measurement_time",
+                "measurement_datetime",
+                "measurement_time_utc"
+            }
+            or "timestamp" in name
+            or name.endswith("_time_utc")
+        ):
+            results["timestamp_columns"].append(str(column))
+
+        # Occupancy sensor/device identifiers.
+        if name in {
+            "sensorid", "sensor_id",
+            "deviceid", "device_id"
+        }:
+            results["sensor_id_columns"].append(str(column))
+
+        # Physical space monitored by each device.
+        if name in {"floorspaceid", "floorspace_id"}:
+            results["floorspace_id_columns"].append(str(column))
+
+        # Occupancy state and other possible occupancy targets.
+        if any(term in name for term in occupancy_terms):
+            results["occupancy_candidate_columns"].append(
+                str(column)
+            )
+
+        # Numeric occupancy target.
+        if name in {"headcount", "people_count", "person_count"}:
+            results["headcount_columns"].append(str(column))
+
+        # Environmental measurements, if present.
+        if any(term in name for term in environmental_terms):
+            results["environmental_columns"].append(str(column))
+
+    return results
+
+def inspect_dataframe(df, source_name):
+    """Create a detailed summary of one data table."""
+    column_info = identify_columns(df)
+
+    print("\n" + "=" * 75)
+    print(f"SOURCE: {source_name}")
+    print("=" * 75)
+
+    print(f"Rows: {len(df):,}")
+    print(f"Columns: {len(df.columns):,}")
+
+    print("\nCOLUMN NAMES AND DATA TYPES")
+    for column in df.columns:
+        print(
+            f"  {column} "
+            f"({df[column].dtype})"
+        )
+
+    print("\nLIKELY RELEVANT COLUMNS")
+    for category, columns in column_info.items():
+        print(f"  {category}: {columns}")
+
+    print("\nFIRST RECORDS")
+    print(df.head(MAX_SAMPLE_ROWS).to_string(index=False))
+
+    print("\nMISSING VALUES")
+    missing = df.isna().sum()
+    missing = missing[missing > 0].sort_values(ascending=False)
+
+    if missing.empty:
+        print("  No missing values detected.")
+    else:
+        print(missing.to_string())
+
+    print("\nDUPLICATE ROWS")
+    print(f"  {df.duplicated().sum():,}")
+
+    # Check candidate timestamp columns.
+    for column in column_info["timestamp_columns"]:
+        parsed = pd.to_datetime(
+            df[column],
+            errors="coerce",
+            utc=True
+        )
+
+        valid = parsed.dropna()
+
+        print(f"\nTIMESTAMP CHECK: {column}")
+        print(f"  Parseable timestamps: {len(valid):,}")
+        print(f"  Unparseable timestamps: {parsed.isna().sum():,}")
+
+        if not valid.empty:
+            print(f"  Earliest UTC: {valid.min()}")
+            print(f"  Latest UTC:   {valid.max()}")
+
+    # Print distinct values for possible occupancy columns.
+    for column in column_info["occupancy_candidate_columns"]:
+        series = df[column]
+
+        print(f"\nOCCUPANCY CANDIDATE: {column}")
+        print(f"  Data type: {series.dtype}")
+        print(f"  Unique values: {series.nunique(dropna=True):,}")
+
+        if series.nunique(dropna=True) <= 30:
+            print(
+                "  Value counts:\n"
+                + series.value_counts(dropna=False)
+                .head(30)
+                .to_string()
+            )
+        else:
+            print(
+                "  Example values: "
+                + str(series.dropna().head(10).tolist())
+            )
+
+    return column_info
+
+
+# ============================================================
+# 3. FIND OCCUPANCY FILES
+# ============================================================
+
+def find_candidate_files():
+    """Find the specified occupancy ZIP and list its data files."""
+
+    candidates = []
+
+    if not DATA_DIR.exists():
+        raise FileNotFoundError(
+            f"Data directory not found: {DATA_DIR}"
+        )
+
+    # Locate the ZIP even if its filename includes (1) or similar.
+    zip_files = list(
+        DATA_DIR.rglob("5occupancySensor_MayToDec2024_9MRows*.zip")
+    )
+
+    if not zip_files:
+        print(
+            "Occupancy ZIP not found in the data directory.\n"
+            f"Expected filename beginning with:\n"
+            "5occupancySensor_MayToDec2024_9MRows"
+        )
+        print(f"Data directory searched: {DATA_DIR}")
+        return candidates
+
+    for zip_path in zip_files:
+        print(f"\nOccupancy archive: {zip_path}")
+
+        with ZipFile(zip_path, "r") as archive:
+            members = [
+                name for name in archive.namelist()
+                if not name.endswith("/")
+            ]
+
+            print(f"Files inside archive: {len(members)}")
+
+            for member in members:
+                info = archive.getinfo(member)
+
+                print(
+                    f"  {member} | "
+                    f"compressed: {info.compress_size:,} bytes | "
+                    f"uncompressed: {info.file_size:,} bytes"
+                )
+
+                suffix = Path(member).suffix.lower()
+
+                if suffix in SUPPORTED_EXTENSIONS:
+                    candidates.append({
+                        "kind": "zip_member",
+                        "archive_path": zip_path,
+                        "member_name": member,
+                        "source_name": f"{zip_path.name}::{member}"
+                    })
+
+    return candidates
+
+
+def load_candidate(candidate):
+    """Load a supported data file from the occupancy ZIP."""
+
+    if candidate["kind"] == "standalone":
+        return read_data_file(candidate["path"])
+
+    if candidate["kind"] == "zip_member":
+        archive_path = candidate["archive_path"]
+        member_name = candidate["member_name"]
+        suffix = Path(member_name).suffix.lower()
+
+        try:
+            with ZipFile(archive_path, "r") as archive:
+                with archive.open(member_name) as file:
+
+                    if suffix == ".csv":
+                        return pd.read_csv(
+                            file,
+                            nrows=1000,
+                            low_memory=False
+                        )
+
+                    if suffix in {".jsonl", ".ndjson"}:
+                        return pd.read_json(
+                            file,
+                            lines=True,
+                            nrows=1000
+                        )
+
+                    if suffix == ".json":
+                        content = json.load(file)
+
+                        if isinstance(content, list):
+                            return pd.DataFrame(content)
+
+                        if isinstance(content, dict):
+                            for key in [
+                                "data", "records", "results", "readings"
+                            ]:
+                                if isinstance(content.get(key), list):
+                                    return pd.DataFrame(
+                                        content[key][:1000]
+                                    )
+
+                            return pd.json_normalize(content)
+
+        except Exception as error:
+            print(f"Could not load {member_name}: {error}")
+
+    return None
+
+# ============================================================
+# 4. MAIN INSPECTION
+# ============================================================
+
+def main():
+    print("=" * 75)
+    print("MMA3001 FILE 06-1: OCCUPANCY DATA INSPECTION")
+    print("=" * 75)
+
+    print(f"Project root: {PROJECT_ROOT}")
+    print(f"Data directory: {DATA_DIR}")
+    print(f"Output directory: {OUTPUT_DIR}")
+
+    candidates = find_candidate_files()
+
+    if not candidates:
+        print("\nNo occupancy-related CSV/JSON files found.")
+        print(
+            "Check whether the filename contains 'occupancy', "
+            "'presence', 'motion', or a related keyword."
+        )
+        print(
+            "If the files have different names or formats, "
+            "we will need to adjust the search."
+        )
+        return
+
+    print(f"\nCandidate files found: {len(candidates)}")
+
+    file_summaries = []
+    column_summaries = []
+    sample_frames = []
+
+    for index, candidate in enumerate(candidates, start=1):
+        print(f"\n[{index}/{len(candidates)}] Loading data...")
+
+        df = load_candidate(candidate)
+
+        if df is None:
+            print("  Skipping unsupported or unreadable file.")
+            continue
+
+        columns = inspect_dataframe(
+            df,
+            candidate["source_name"]
+        )
+
+        file_summaries.append({
+            "source": candidate["source_name"],
+            "rows": len(df),
+            "columns": len(df.columns),
+            "duplicate_rows": int(df.duplicated().sum()),
+            "timestamp_columns": "; ".join(
+                columns["timestamp_columns"]
+            ),
+            "sensor_id_columns": "; ".join(
+                columns["sensor_id_columns"]
+            ),
+            "occupancy_candidate_columns": "; ".join(
+                columns["occupancy_candidate_columns"]
+            ),
+            "environmental_columns": "; ".join(
+                columns["environmental_columns"]
+            )
+        })
+
+        for column in df.columns:
+            column_summaries.append({
+                "source": candidate["source_name"],
+                "column": str(column),
+                "dtype": str(df[column].dtype),
+                "missing_count": int(df[column].isna().sum()),
+                "missing_percent": (
+                    round(df[column].isna().mean() * 100, 2)
+                    if len(df) else 0
+                ),
+                "unique_values": int(df[column].nunique(dropna=True))
+            })
+
+        # Save a small sample for easy review.
+        sample = df.head(MAX_SAMPLE_ROWS).copy()
+        sample.insert(0, "inspection_source", candidate["source_name"])
+        sample_frames.append(sample)
+
+    if file_summaries:
+        pd.DataFrame(file_summaries).to_csv(
+            OUTPUT_DIR / "occupancy_file_summary.csv",
+            index=False
+        )
+
+        pd.DataFrame(column_summaries).to_csv(
+            OUTPUT_DIR / "occupancy_column_summary.csv",
+            index=False
+        )
+
+        if sample_frames:
+            pd.concat(
+                sample_frames,
+                ignore_index=True,
+                sort=False
+            ).to_csv(
+                OUTPUT_DIR / "occupancy_sample_records.csv",
+                index=False
+            )
+
+    print("\n" + "=" * 75)
+    print("INSPECTION COMPLETE")
+    print("=" * 75)
+    print(f"Readable files: {len(file_summaries)}")
+    print(f"Reports saved to: {OUTPUT_DIR}")
+    print("\nGenerated reports:")
+    print("  occupancy_file_summary.csv")
+    print("  occupancy_column_summary.csv")
+    print("  occupancy_sample_records.csv")
+
+    print(
+        "\nIMPORTANT: Candidate column names are only clues. "
+        "Confirm the sensor's meaning and units before treating "
+        "its readings as ground-truth occupancy."
+    )
+
+
+if __name__ == "__main__":
+    main()
