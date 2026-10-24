@@ -1,0 +1,250 @@
+
+import json
+import zipfile
+from pathlib import Path
+
+import pandas as pd
+
+
+# --------------------------------------------------
+# File paths
+# --------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+ZIP_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "5EnvSensor_MayToDec2024_180kRows.zip"
+)
+
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "diagnostics"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# --------------------------------------------------
+# Load a sample of the ORIGINAL data
+# --------------------------------------------------
+
+with zipfile.ZipFile(ZIP_PATH, "r") as archive:
+    csv_files = [
+        name for name in archive.namelist()
+        if name.lower().endswith(".csv")
+    ]
+
+    if not csv_files:
+        raise FileNotFoundError("No CSV file found inside the ZIP.")
+
+    with archive.open(csv_files[0]) as file:
+        df = pd.read_csv(file)
+
+print("Original rows loaded:", len(df))
+print("Original columns:", df.columns.tolist())
+
+
+# --------------------------------------------------
+# Parse record dates
+# --------------------------------------------------
+
+for column in ["createdate", "processdate"]:
+    if column in df.columns:
+        df[column + "_parsed"] = pd.to_datetime(
+            df[column],
+            errors="coerce",
+            utc=True
+        )
+
+
+# --------------------------------------------------
+# Inspect measurement timestamps from JSON
+# --------------------------------------------------
+
+def inspect_json(json_text):
+    """Extract each variable's timestamp and value."""
+
+    result = {}
+
+    if pd.isna(json_text):
+        return result
+
+    try:
+        measurements = json.loads(json_text)
+    except (json.JSONDecodeError, TypeError):
+        return result
+
+    if not isinstance(measurements, list):
+        return result
+
+    for measurement in measurements:
+        variable = measurement.get("variable", {})
+        name = variable.get("name", "unknown")
+
+        values = measurement.get("values", [])
+
+        if not values:
+            continue
+
+        first_value = values[0]
+
+        result[name + "_time"] = first_value.get("time")
+        result[name + "_value"] = first_value.get("value")
+
+    return result
+
+
+expanded = df["jsondata"].apply(inspect_json).apply(pd.Series)
+
+# Keep the original row index so results can be traced back.
+expanded.index = df.index
+
+df = pd.concat([df, expanded], axis=1)
+
+
+# --------------------------------------------------
+# Convert Unix timestamps to UTC datetimes
+# --------------------------------------------------
+
+time_columns = [
+    column for column in df.columns
+    if column.endswith("_time")
+]
+
+for column in time_columns:
+    df[column] = pd.to_datetime(
+        pd.to_numeric(df[column], errors="coerce"),
+        unit="s",
+        errors="coerce",
+        utc=True
+    )
+
+
+# --------------------------------------------------
+# Summarise timestamp quality by sensor and variable
+# --------------------------------------------------
+
+summary_rows = []
+
+for sensor_id, group in df.groupby("sensorid", dropna=False):
+    for time_column in time_columns:
+        valid_times = group[time_column].dropna()
+
+        if valid_times.empty:
+            continue
+
+        summary_rows.append({
+            "sensorid": sensor_id,
+            "variable": time_column.removesuffix("_time"),
+            "rows": len(group),
+            "valid_timestamps": len(valid_times),
+            "unique_timestamps": valid_times.nunique(),
+            "earliest_timestamp": valid_times.min(),
+            "latest_timestamp": valid_times.max(),
+            "median_timestamp": valid_times.median(),
+        })
+
+summary = pd.DataFrame(summary_rows)
+
+summary.to_csv(
+    OUTPUT_DIR / "timestamp_quality_by_variable.csv",
+    index=False
+)
+
+print("\nTimestamp summary by sensor and variable:")
+print(summary.to_string(index=False))
+
+
+# --------------------------------------------------
+# Compare measurement, creation and processing dates
+# --------------------------------------------------
+
+comparison_rows = []
+
+for time_column in time_columns:
+    for reference_column in [
+        "createdate_parsed",
+        "processdate_parsed"
+    ]:
+        if reference_column not in df.columns:
+            continue
+
+        difference = (
+            df[time_column] - df[reference_column]
+        ).dt.total_seconds() / 60
+
+        comparison_rows.append({
+            "measurement_variable": time_column.removesuffix("_time"),
+            "reference_date": reference_column,
+            "valid_comparisons": difference.notna().sum(),
+            "median_difference_minutes": difference.median(),
+            "minimum_difference_minutes": difference.min(),
+            "maximum_difference_minutes": difference.max(),
+            "within_10_minutes": (
+                difference.abs() <= 10
+            ).sum(),
+        })
+
+comparison = pd.DataFrame(comparison_rows)
+
+comparison.to_csv(
+    OUTPUT_DIR / "measurement_vs_record_dates.csv",
+    index=False
+)
+
+print("\nMeasurement timestamps compared with record dates:")
+print(comparison.to_string(index=False))
+
+
+# --------------------------------------------------
+# Save representative original records
+# --------------------------------------------------
+
+# Pick the five sensors with the most rows.
+largest_sensors = (
+    df["sensorid"]
+    .value_counts()
+    .head(5)
+    .index
+)
+
+samples = []
+
+for sensor_id in largest_sensors:
+    group = df[df["sensorid"] == sensor_id].copy()
+
+    # Sample across the record creation timeline.
+    group = group.sort_values("createdate_parsed")
+
+    if len(group) > 12:
+        positions = [
+            round(i * (len(group) - 1) / 11)
+            for i in range(12)
+        ]
+        group = group.iloc[positions]
+
+    samples.append(group)
+
+sample_df = pd.concat(samples, ignore_index=True)
+
+# Keep useful columns without losing the original JSON.
+base_columns = [
+    column for column in [
+        "id",
+        "sensorid",
+        "createdate",
+        "processdate",
+        "createdate_parsed",
+        "processdate_parsed",
+        "jsondata",
+    ]
+    if column in sample_df.columns
+]
+
+sample_df[base_columns].to_csv(
+    OUTPUT_DIR / "original_timestamp_samples.csv",
+    index=False
+)
+
+print("\nSaved diagnostic files to:", OUTPUT_DIR)
+print("- timestamp_quality_by_variable.csv")
+print("- measurement_vs_record_dates.csv")
+print("- original_timestamp_samples.csv")
