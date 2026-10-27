@@ -1,18 +1,20 @@
+
 """
-FILE-01: Occupancy timing and transition analysis.
+Occupancy timing and transition analysis.
 
-This script processes raw occupancy sensor records from a ZIP archive
-and aggregates them into five-minute intervals for each floor space.
+This script processes occupancy sensor records from a ZIP archive and
+aggregates them into five-minute intervals for each floor space.
 
-It analyses:
+The analysis examines:
     1. Time gaps between consecutive observations.
-    2. Transitions between recorded occupancy states.
-    3. The probability of each state following another state.
-    4. The observed duration of consecutive runs of the same state.
+    2. Counts and probabilities of recorded state transitions.
+    3. Short-gap transitions where consecutive observations are no more
+       than five minutes apart.
+    4. Observed durations of consecutive runs of the same state.
 
-The analysis describes recorded sensor states rather than independently
-verified physical occupancy. Observed run durations are therefore
-estimates based on the available records.
+The analysis describes recorded sensor states, not independently
+verified physical occupancy. Run durations are observed spans between
+the first and last observations in each run.
 
 Outputs are saved to:
     outputs/occupancy_timing_analysis/
@@ -28,17 +30,17 @@ import pandas as pd
 # 1. SETTINGS
 # ============================================================
 
-# Locate the project root relative to this script.
+# Find the project root relative to this Python file.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# Input dataset.
+# Path to the compressed occupancy dataset.
 ZIP_FILE = (
     PROJECT_ROOT
     / "data"
     / "5occupancySensor_MayToDec2024_9MRows (1).zip"
 )
 
-# Directory for all generated analysis outputs.
+# Directory for generated CSV files.
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "occupancy_timing_analysis"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -48,22 +50,30 @@ CHUNK_SIZE = 250_000
 # Length of each aggregation interval, in minutes.
 INTERVAL_MINUTES = 5
 
+# Maximum gap allowed for the short-gap transition analysis.
+MAX_TRANSITION_GAP_MINUTES = 5
+
 
 def load_and_aggregate_data():
-    """Load sensor records and retain the last observation per five-minute interval.
+    """Load the ZIP dataset and aggregate records into five-minute bins.
 
-    Records are read in chunks to reduce memory usage when processing
-    the large source dataset. Timestamps are converted to UTC, and
-    records missing essential fields are removed.
+    Records are read in chunks to reduce memory usage. Invalid timestamps
+    and records missing essential fields are removed.
 
-    Within each floor space and interval, the observation with the
-    latest timestamp is retained. Duplicate intervals occurring across
-    different chunks are resolved after combining the chunk results.
+    For each floor space and five-minute interval, the observation with
+    the latest timestamp is retained. Duplicate intervals across chunks
+    are resolved after combining the chunk results.
 
     Returns:
-        pd.DataFrame: Aggregated observations sorted by floor space
-        and interval.
+        pd.DataFrame: Aggregated observations sorted by floor space and
+        interval, including the retained observation timestamp.
     """
+    if not ZIP_FILE.is_file():
+        raise FileNotFoundError(
+            f"Occupancy ZIP file not found:\n{ZIP_FILE}\n"
+            "Check the filename and location in the SETTINGS section."
+        )
+
     interval_chunks = []
     total_rows = 0
 
@@ -78,9 +88,11 @@ def load_and_aggregate_data():
         ]
 
         if not csv_files:
-            raise FileNotFoundError("No CSV found in occupancy ZIP.")
+            raise FileNotFoundError(
+                f"No CSV file found inside {ZIP_FILE.name}."
+            )
 
-        # Read only the columns required for this analysis.
+        # Read only the columns needed for this analysis.
         with archive.open(csv_files[0]) as file:
             for chunk in pd.read_csv(
                 file,
@@ -94,7 +106,7 @@ def load_and_aggregate_data():
             ):
                 total_rows += len(chunk)
 
-                # Parse timestamps and discard invalid records.
+                # Convert timestamps to UTC and discard invalid records.
                 chunk["collecteddate"] = pd.to_datetime(
                     chunk["collecteddate"],
                     utc=True,
@@ -109,13 +121,13 @@ def load_and_aggregate_data():
                     ]
                 ).copy()
 
-                # Assign each observation to a five-minute interval.
+                # Assign each timestamp to its five-minute interval.
                 chunk["interval"] = chunk["collecteddate"].dt.floor(
                     f"{INTERVAL_MINUTES}min"
                 )
 
-                # Sort chronologically before selecting the latest
-                # observation within each floor-space interval.
+                # Sort chronologically before retaining the latest record
+                # in each floor-space interval.
                 chunk = chunk.sort_values(
                     "collecteddate",
                     kind="stable",
@@ -126,7 +138,7 @@ def load_and_aggregate_data():
                     keep="last",
                 )
 
-                # Keep only the columns needed for later analysis.
+                # Store only the columns required by later analyses.
                 interval_chunks.append(
                     chunk[
                         [
@@ -145,8 +157,8 @@ def load_and_aggregate_data():
 
     print("\nCombining interval summaries...")
 
-    # Combine chunk-level summaries and resolve duplicate intervals
-    # that may have appeared in different chunks.
+    # Combine chunk-level results and resolve duplicate intervals
+    # that occurred in different chunks.
     data = pd.concat(interval_chunks, ignore_index=True)
     del interval_chunks
 
@@ -160,7 +172,8 @@ def load_and_aggregate_data():
         keep="last",
     )
 
-    # Sort by floor space and time for chronological analysis.
+    # Ensure observations are ordered chronologically within each
+    # floor space before calculating gaps and transitions.
     data = data.sort_values(
         ["floorspaceid", "interval"],
         kind="stable",
@@ -172,31 +185,40 @@ def load_and_aggregate_data():
     return data
 
 
-def analyse_observation_gaps(data):
-    """Calculate the time between consecutive observations per floor space.
+def calculate_observation_gaps(data):
+    """Calculate time gaps between consecutive observations per floor space.
 
-    The gap is calculated using the difference between consecutive
-    aggregated interval timestamps. Summary statistics are then
-    calculated separately for each floor space.
+    The gap is measured between the timestamps of the aggregated bins.
+    Summary statistics describe observation frequency and the size of
+    gaps in the recorded dataset.
+
+    Returns:
+        pd.DataFrame: Data containing previous intervals and gap lengths.
+    """
+    # Find the previous aggregated interval for each floor space.
+    data["previous_interval"] = (
+        data.groupby("floorspaceid")["interval"].shift(1)
+    )
+
+    # Calculate the elapsed time between consecutive interval timestamps.
+    data["gap_minutes"] = (
+        data["interval"] - data["previous_interval"]
+    ).dt.total_seconds() / 60
+
+    return data
+
+
+def analyse_observation_gaps(data):
+    """Summarise observation gaps for each floor space.
 
     Saves:
         observation_gap_summary.csv
     """
     print("\nAnalysing observation time gaps...")
 
-    # Find the preceding interval for each floor space.
-    data["previous_interval"] = (
-        data.groupby("floorspaceid")["interval"].shift(1)
-    )
-
-    # Calculate elapsed time in minutes between consecutive intervals.
-    data["gap_minutes"] = (
-        data["interval"] - data["previous_interval"]
-    ).dt.total_seconds() / 60
-
     gap_data = data.dropna(subset=["gap_minutes"])
 
-    # Summarise typical and unusually long observation gaps.
+    # Calculate typical gaps and upper-percentile gap lengths.
     gap_summary = (
         gap_data.groupby("floorspaceid")["gap_minutes"]
         .agg(
@@ -220,32 +242,29 @@ def analyse_observation_gaps(data):
         gap_summary.to_string(
             index=False,
             float_format="%.2f",
+            col_space=12,
         )
     )
 
 
-def analyse_state_transitions(data):
-    """Count state transitions and calculate conditional transition probabilities.
+def calculate_transition_counts(data):
+    """Count transitions between consecutive recorded states.
 
-    Each transition represents a pair of consecutive recorded states
-    for the same floor space. Probabilities are calculated by dividing
-    each transition count by the total number of transitions originating
-    from the corresponding previous state.
+    Transitions are calculated separately within each floor space.
+    The function includes transitions across all observed time gaps.
 
-    Saves:
-        state_transition_counts.csv
-        state_transition_probabilities.csv
+    Returns:
+        pd.DataFrame: Counts indexed by previous and current state.
     """
-    print("\nAnalysing occupancy state transitions...")
-
     # Identify the previous recorded state within each floor space.
     data["previous_state"] = (
         data.groupby("floorspaceid")["occupancystatus"].shift(1)
     )
 
-    transitions = data.dropna(subset=["previous_state"])
+    # Keep observations that have a preceding state.
+    transitions = data.dropna(subset=["previous_state"]).copy()
 
-    # Count how often each previous/current state combination occurs.
+    # Count each previous-state/current-state combination.
     transition_counts = (
         transitions.groupby(
             ["previous_state", "occupancystatus"]
@@ -255,40 +274,124 @@ def analyse_state_transitions(data):
         .sort_values("count", ascending=False)
     )
 
+    return transition_counts
+
+
+def save_transition_results(transition_counts, prefix=""):
+    """Save transition counts, probabilities, and a readable summary.
+
+    Probabilities are conditional on the previous recorded state.
+    For each previous state, its outgoing transition probabilities
+    sum to one, subject to numerical rounding.
+
+    Args:
+        transition_counts: DataFrame containing transition counts.
+        prefix: Optional filename prefix for separate analyses.
+    """
     # Save the raw transition counts.
     transition_counts.to_csv(
-        OUTPUT_DIR / "state_transition_counts.csv",
+        OUTPUT_DIR / f"{prefix}state_transition_counts.csv",
         index=False,
     )
 
-    print("\nMOST COMMON STATE TRANSITIONS")
-    print(transition_counts.head(20).to_string(index=False))
-
-    # Estimate the probability of the current state given the
-    # previous recorded state.
-    transition_counts["probability"] = (
-        transition_counts["count"]
-        / transition_counts.groupby("previous_state")["count"]
-        .transform("sum")
+    print(f"\n{prefix.upper()}MOST COMMON STATE TRANSITIONS")
+    print(
+        transition_counts.head(20).to_string(
+            index=False,
+            col_space=12,
+        )
     )
 
-    transition_counts.to_csv(
-        OUTPUT_DIR / "state_transition_probabilities.csv",
+    # Calculate the probability of each next state, conditional on
+    # the previous state.
+    probabilities = transition_counts.copy()
+
+    if not probabilities.empty:
+        probabilities["probability"] = (
+            probabilities["count"]
+            / probabilities.groupby("previous_state")["count"]
+            .transform("sum")
+        )
+
+    probabilities.to_csv(
+        OUTPUT_DIR / f"{prefix}state_transition_probabilities.csv",
         index=False,
+    )
+
+
+def analyse_state_transitions(data):
+    """Analyse transitions across all consecutive recorded observations.
+
+    Long observation gaps are included, so these results describe
+    transitions between consecutive records rather than exclusively
+    short-term changes.
+
+    Saves:
+        state_transition_counts.csv
+        state_transition_probabilities.csv
+    """
+    print("\nAnalysing occupancy state transitions...")
+
+    transition_counts = calculate_transition_counts(data)
+
+    save_transition_results(transition_counts)
+
+
+def analyse_short_gap_transitions(data):
+    """Analyse transitions where consecutive observations are close in time.
+
+    Only transitions with a gap of five minutes or less are included.
+    This helps distinguish short-gap transitions from transitions
+    separated by longer periods without recorded observations.
+
+    Saves:
+        short_gap_state_transition_counts.csv
+        short_gap_state_transition_probabilities.csv
+    """
+    print("\nAnalysing short-gap state transitions...")
+
+    # Calculate the previous recorded state for each floor space.
+    data["previous_state"] = (
+        data.groupby("floorspaceid")["occupancystatus"].shift(1)
+    )
+
+    # Keep only observations with a preceding state and a short gap.
+    short_gap_data = data.loc[
+        data["previous_state"].notna()
+        & data["gap_minutes"].le(MAX_TRANSITION_GAP_MINUTES)
+    ].copy()
+
+    # Count the transitions remaining after the gap filter.
+    short_gap_counts = (
+        short_gap_data.groupby(
+            ["previous_state", "occupancystatus"]
+        )
+        .size()
+        .reset_index(name="count")
+        .sort_values("count", ascending=False)
+    )
+
+    print(
+        "Transitions included:",
+        f"{len(short_gap_data):,}",
+    )
+
+    save_transition_results(
+        short_gap_counts,
+        prefix="short_gap_",
     )
 
 
 def analyse_state_run_durations(data):
-    """Summarise the observed spans of consecutive runs of each state.
+    """Summarise observed runs of consecutive identical recorded states.
 
-    A new run starts when the recorded state changes, the first
-    observation for a floor space is reached, or the gap between
-    consecutive aggregated observations exceeds one interval.
+    A new run begins when the recorded state changes, the floor space
+    has no previous observation, or the gap between observations
+    exceeds the aggregation interval.
 
     The observed span is the elapsed time between the first and last
-    observations in a run. It does not establish the true start or end
-    of physical occupancy, and a single-observation run has a span of
-    zero minutes.
+    observations in a run. It is not the true physical duration of
+    occupancy. A run containing one observation has a span of zero.
 
     Saves:
         observed_state_run_summary.csv
@@ -296,20 +399,20 @@ def analyse_state_run_durations(data):
     """
     print("\nEstimating observed state-run durations...")
 
-    # Find the previous state within each floor space.
+    # Identify the previous state within each floor space.
     data["previous_state"] = (
         data.groupby("floorspaceid")["occupancystatus"].shift(1)
     )
 
-    # Mark the start of a new run if the state changes or observations
-    # are separated by a gap greater than five minutes.
+    # Start a new run at the first observation, after a state change,
+    # or following a gap longer than one aggregation interval.
     data["new_run"] = (
         data["previous_state"].isna()
         | data["occupancystatus"].ne(data["previous_state"])
         | data["gap_minutes"].gt(INTERVAL_MINUTES)
     )
 
-    # Assign a unique sequential run identifier within each floor space.
+    # Assign a sequential run identifier within each floor space.
     data["run_id"] = (
         data.groupby("floorspaceid")["new_run"].cumsum()
     )
@@ -327,12 +430,12 @@ def analyse_state_run_durations(data):
         )
     )
 
-    # Calculate the observed elapsed span of each run.
+    # Calculate the elapsed span between the first and last observation.
     runs["observed_span_minutes"] = (
         runs["last_interval"] - runs["first_interval"]
     ).dt.total_seconds() / 60
 
-    # Summarise run counts and durations for each recorded state.
+    # Summarise run counts and observed spans for each recorded state.
     duration_summary = (
         runs.groupby("occupancystatus")
         .agg(
@@ -363,10 +466,11 @@ def analyse_state_run_durations(data):
         duration_summary.to_string(
             index=False,
             float_format="%.2f",
+            col_space=12,
         )
     )
 
-    # Save the details of every individual observed run.
+    # Save details of each individual observed run.
     runs.to_csv(
         OUTPUT_DIR / "observed_state_runs.csv",
         index=False,
@@ -374,24 +478,29 @@ def analyse_state_run_durations(data):
 
 
 def main():
-    """Run the complete occupancy timing and transition analysis.
+    """Run all occupancy timing and transition analyses.
 
-    Loads and aggregates the source data, performs the three analyses,
-    and saves the aggregated observations and analysis outputs.
+    Loads and aggregates the source data, calculates observation gaps,
+    analyses state transitions, compares short-gap transitions, and
+    summarises observed state-run durations.
     """
     print("=" * 65)
     print("OCCUPANCY TIMING AND TRANSITION ANALYSIS")
     print("=" * 65)
 
-    # Prepare the five-minute dataset used by all subsequent analyses.
+    # Load the source data and aggregate it into five-minute intervals.
     data = load_and_aggregate_data()
+
+    # Calculate time gaps once and reuse them in subsequent analyses.
+    data = calculate_observation_gaps(data)
 
     # Examine observation frequency and state transition behaviour.
     analyse_observation_gaps(data)
     analyse_state_transitions(data)
+    analyse_short_gap_transitions(data)
     analyse_state_run_durations(data)
 
-    # Save the aggregated dataset for inspection and reuse.
+    # Save the aggregated observations for later analysis.
     data.to_csv(
         OUTPUT_DIR / "occupancy_5min_intervals.csv",
         index=False,
@@ -401,10 +510,12 @@ def main():
     print(OUTPUT_DIR)
 
     print("\nImportant:")
-    print("- Five-minute aggregation simplifies irregular source records.")
+    print("- Five-minute aggregation retains existing observations only.")
     print("- State-run durations are observed spans, not true durations.")
-    print("- Long gaps are not treated as continuous state persistence.")
+    print("- All-gap transitions may span long periods without observations.")
+    print("- Short-gap transitions include gaps of five minutes or less.")
     print("- No environmental room mapping is assumed.")
+
     print("\nAnalysis complete.")
 
 
