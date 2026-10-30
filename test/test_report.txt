@@ -1,0 +1,43 @@
+OCCUPANCY MODELLING TEST REPORT
+========================================
+Execution date: 2026-10-31 00:14:32.891449+11:00
+
+test_confusion_matrix_counts_correct_predictions (test_class_analysis.TestClassAnalysis.test_confusion_matrix_counts_correct_predictions) ... ok
+test_recall_for_each_class (test_class_analysis.TestClassAnalysis.test_recall_for_each_class) ... ok
+test_unexpected_class_can_be_detected (test_class_analysis.TestClassAnalysis.test_unexpected_class_can_be_detected) ... ok
+test_incorrect_prediction_reduces_accuracy (test_forecasting.TestValidation.test_incorrect_prediction_reduces_accuracy) ... ok
+test_macro_f1_is_between_zero_and_one (test_forecasting.TestValidation.test_macro_f1_is_between_zero_and_one) ... ok
+test_perfect_prediction_accuracy (test_forecasting.TestValidation.test_perfect_prediction_accuracy) ... ok
+test_perfect_predictions_have_perfect_f1 (test_forecasting.TestValidation.test_perfect_predictions_have_perfect_f1) ... ok
+test_all_scripts_exist (test_pipeline.TestOccupancyPipeline.test_all_scripts_exist) ... ok
+test_all_scripts_have_valid_python_syntax (test_pipeline.TestOccupancyPipeline.test_all_scripts_have_valid_python_syntax) ... ok
+test_script_names_are_unique (test_pipeline.TestOccupancyPipeline.test_script_names_are_unique) ... ok
+test_script_names_end_in_python_extension (test_pipeline.TestOccupancyPipeline.test_script_names_end_in_python_extension) ... ok
+test_seven_scripts_are_configured (test_pipeline.TestOccupancyPipeline.test_seven_scripts_are_configured) ... ok
+test_later_window_starts_later (test_rolling_evaluation.TestRollingEvaluation.test_later_window_starts_later) ... ok
+test_rolling_windows_have_expected_size (test_rolling_evaluation.TestRollingEvaluation.test_rolling_windows_have_expected_size) ... ok
+test_rolling_windows_preserve_time_order (test_rolling_evaluation.TestRollingEvaluation.test_rolling_windows_preserve_time_order) ... ok
+test_absolute_change (test_sensitivity.TestSensitivity.test_absolute_change) ... ok
+test_no_change_gives_zero_sensitivity (test_sensitivity.TestSensitivity.test_no_change_gives_zero_sensitivity) ... ok
+test_relative_percentage_change (test_sensitivity.TestSensitivity.test_relative_percentage_change) ... ok
+test_sensitivity_detects_degradation (test_sensitivity.TestSensitivity.test_sensitivity_detects_degradation) ... ok
+test_gaps_are_calculated_in_minutes (test_timing_analysis.TestTimingAnalysis.test_gaps_are_calculated_in_minutes) ... ok
+test_irregular_observation_gap (test_timing_analysis.TestTimingAnalysis.test_irregular_observation_gap) ... ok
+test_regular_observation_gaps (test_timing_analysis.TestTimingAnalysis.test_regular_observation_gaps) ... ok
+test_incorrect_prediction_reduces_accuracy (test_validation.TestValidation.test_incorrect_prediction_reduces_accuracy) ... ok
+test_macro_f1_is_between_zero_and_one (test_validation.TestValidation.test_macro_f1_is_between_zero_and_one) ... ok
+test_perfect_prediction_accuracy (test_validation.TestValidation.test_perfect_prediction_accuracy) ... ok
+test_perfect_predictions_have_perfect_f1 (test_validation.TestValidation.test_perfect_predictions_have_perfect_f1) ... ok
+
+----------------------------------------------------------------------
+Ran 26 tests in 0.100s
+
+OK
+
+========================================
+Tests run: 26
+Passed: 26
+Failures: 0
+Errors: 0
+Skipped: 0
+Overall result: PASSED
