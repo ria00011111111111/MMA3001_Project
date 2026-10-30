@@ -1,23 +1,38 @@
 
 """
-Occupancy timing and transition analysis.
+Occupancy Timing and Transition Analysis
+========================================
 
-This script processes occupancy sensor records from a ZIP archive and
-aggregates them into five-minute intervals for each floor space.
+Processes occupancy sensor records from a compressed ZIP archive
+and aggregates observations into five-minute intervals for each
+floor space.
 
 The analysis examines:
-    1. Time gaps between consecutive observations.
-    2. Counts and probabilities of recorded state transitions.
-    3. Short-gap transitions where consecutive observations are no more
-       than five minutes apart.
-    4. Observed durations of consecutive runs of the same state.
 
-The analysis describes recorded sensor states, not independently
-verified physical occupancy. Run durations are observed spans between
-the first and last observations in each run.
+1. Observation gaps between consecutive aggregated intervals.
+2. Counts and conditional probabilities of recorded state transitions.
+3. Short-gap transitions where consecutive observations are no more
+   than five minutes apart.
+4. Observed durations of consecutive runs of identical recorded states.
 
-Outputs are saved to:
+Data Processing:
+    - Reads the source CSV in chunks to manage memory usage.
+    - Removes records with missing essential fields or invalid timestamps.
+    - Assigns observations to five-minute intervals.
+    - Retains the latest timestamped observation per floor space
+      and interval.
+
+Outputs:
+    Generated CSV files are saved to:
     outputs/occupancy_timing_analysis/
+
+Limitations:
+    The analysis describes recorded sensor states, not independently
+    verified physical occupancy.
+
+    Run durations represent the elapsed time between the first and
+    last observations in a run. They do not establish continuous
+    physical occupancy between observations.
 """
 
 from pathlib import Path
@@ -55,18 +70,24 @@ MAX_TRANSITION_GAP_MINUTES = 5
 
 
 def load_and_aggregate_data():
-    """Load the ZIP dataset and aggregate records into five-minute bins.
+    """Load occupancy records and aggregate them into five-minute intervals.
 
-    Records are read in chunks to reduce memory usage. Invalid timestamps
-    and records missing essential fields are removed.
+    Reads the source CSV inside the ZIP archive in chunks, converts
+    timestamps to UTC, and removes records with missing essential fields.
 
-    For each floor space and five-minute interval, the observation with
-    the latest timestamp is retained. Duplicate intervals across chunks
-    are resolved after combining the chunk results.
+    For each floor space and five-minute interval, retains the observation
+    with the latest original timestamp. Duplicate intervals occurring
+    across different chunks are resolved after combining the results.
 
     Returns:
-        pd.DataFrame: Aggregated observations sorted by floor space and
-        interval, including the retained observation timestamp.
+        pd.DataFrame: Aggregated observations containing floor-space ID,
+            interval timestamp, recorded occupancy state, and original
+            observation timestamp.
+
+    Raises:
+        FileNotFoundError: If the ZIP archive does not exist or contains
+            no CSV file.
+        ValueError: If no valid occupancy records are found.
     """
     if not ZIP_FILE.is_file():
         raise FileNotFoundError(
@@ -186,14 +207,22 @@ def load_and_aggregate_data():
 
 
 def calculate_observation_gaps(data):
-    """Calculate time gaps between consecutive observations per floor space.
+    """Calculate gaps between consecutive aggregated observations.
 
-    The gap is measured between the timestamps of the aggregated bins.
-    Summary statistics describe observation frequency and the size of
-    gaps in the recorded dataset.
+    Calculates the difference between consecutive five-minute interval
+    timestamps separately for each floor space.
+
+    Args:
+        data (pd.DataFrame): Aggregated occupancy observations.
 
     Returns:
-        pd.DataFrame: Data containing previous intervals and gap lengths.
+        pd.DataFrame: Input data with two additional columns:
+            - previous_interval: Previous interval timestamp.
+            - gap_minutes: Time difference in minutes.
+
+    Note:
+        Gaps are calculated using aggregated interval timestamps rather
+        than the original collecteddate timestamps.
     """
     # Find the previous aggregated interval for each floor space.
     data["previous_interval"] = (
@@ -209,10 +238,17 @@ def calculate_observation_gaps(data):
 
 
 def analyse_observation_gaps(data):
-    """Summarise observation gaps for each floor space.
+    """Calculate and export observation-gap statistics by floor space.
 
-    Saves:
-        observation_gap_summary.csv
+    Calculates the number of consecutive observation gaps, median and
+    mean gap lengths, 90th and 95th percentiles, and maximum gap.
+
+    Args:
+        data (pd.DataFrame): Aggregated observations containing gap_minutes.
+
+    Outputs:
+        observation_gap_summary.csv: Observation-gap statistics for
+            each floor space.
     """
     print("\nAnalysing observation time gaps...")
 
@@ -248,13 +284,22 @@ def analyse_observation_gaps(data):
 
 
 def calculate_transition_counts(data):
-    """Count transitions between consecutive recorded states.
+    """Count transitions between consecutive recorded occupancy states.
 
-    Transitions are calculated separately within each floor space.
-    The function includes transitions across all observed time gaps.
+    Identifies the previous recorded state separately for each floor
+    space and counts each previous-state/current-state combination.
+
+    Args:
+        data (pd.DataFrame): Aggregated occupancy observations containing
+            occupancy states and floor-space identifiers.
 
     Returns:
-        pd.DataFrame: Counts indexed by previous and current state.
+        pd.DataFrame: Transition counts containing previous_state,
+            occupancystatus, and count.
+
+    Note:
+        Transitions are included regardless of the elapsed time between
+        consecutive observations.
     """
     # Identify the previous recorded state within each floor space.
     data["previous_state"] = (
@@ -278,15 +323,20 @@ def calculate_transition_counts(data):
 
 
 def save_transition_results(transition_counts, prefix=""):
-    """Save transition counts, probabilities, and a readable summary.
+    """Export transition counts and conditional transition probabilities.
 
-    Probabilities are conditional on the previous recorded state.
-    For each previous state, its outgoing transition probabilities
-    sum to one, subject to numerical rounding.
+    Calculates the probability of each current state given the previous
+    recorded state. Probabilities are normalised separately for each
+    previous state.
 
     Args:
-        transition_counts: DataFrame containing transition counts.
-        prefix: Optional filename prefix for separate analyses.
+        transition_counts (pd.DataFrame): Transition counts containing
+            previous_state, occupancystatus, and count.
+        prefix (str): Optional filename prefix used to distinguish
+            separate transition analyses.
+
+    Outputs:
+        A transition-count CSV and a transition-probability CSV.
     """
     # Save the raw transition counts.
     transition_counts.to_csv(
@@ -322,11 +372,13 @@ def save_transition_results(transition_counts, prefix=""):
 def analyse_state_transitions(data):
     """Analyse transitions across all consecutive recorded observations.
 
-    Long observation gaps are included, so these results describe
-    transitions between consecutive records rather than exclusively
-    short-term changes.
+    Calculates transition counts and conditional transition probabilities
+    without filtering based on the elapsed time between observations.
 
-    Saves:
+    Args:
+        data (pd.DataFrame): Aggregated occupancy observations.
+
+    Outputs:
         state_transition_counts.csv
         state_transition_probabilities.csv
     """
@@ -338,13 +390,17 @@ def analyse_state_transitions(data):
 
 
 def analyse_short_gap_transitions(data):
-    """Analyse transitions where consecutive observations are close in time.
+    """Analyse transitions separated by five minutes or less.
 
-    Only transitions with a gap of five minutes or less are included.
-    This helps distinguish short-gap transitions from transitions
-    separated by longer periods without recorded observations.
+    Filters consecutive observations using gap_minutes and calculates
+    transition counts and conditional transition probabilities for the
+    remaining observations.
 
-    Saves:
+    Args:
+        data (pd.DataFrame): Aggregated observations containing previous
+            states and calculated observation gaps.
+
+    Outputs:
         short_gap_state_transition_counts.csv
         short_gap_state_transition_probabilities.csv
     """
@@ -383,19 +439,26 @@ def analyse_short_gap_transitions(data):
 
 
 def analyse_state_run_durations(data):
-    """Summarise observed runs of consecutive identical recorded states.
+    """Calculate observed durations of consecutive recorded state runs.
 
-    A new run begins when the recorded state changes, the floor space
-    has no previous observation, or the gap between observations
-    exceeds the aggregation interval.
+    A new run begins when the floor space has no previous observation,
+    the recorded state changes, or the observation gap exceeds five
+    minutes.
 
-    The observed span is the elapsed time between the first and last
-    observations in a run. It is not the true physical duration of
-    occupancy. A run containing one observation has a span of zero.
+    Groups observations into runs and calculates the elapsed time
+    between the first and last interval in each run.
 
-    Saves:
+    Args:
+        data (pd.DataFrame): Aggregated occupancy observations containing
+            previous states and calculated observation gaps.
+
+    Outputs:
         observed_state_run_summary.csv
         observed_state_runs.csv
+
+    Note:
+        Observed spans are not verified physical occupancy durations.
+        A run containing one observation has an observed span of zero.
     """
     print("\nEstimating observed state-run durations...")
 
@@ -478,11 +541,20 @@ def analyse_state_run_durations(data):
 
 
 def main():
-    """Run all occupancy timing and transition analyses.
+    """Execute the complete occupancy timing and transition analysis.
 
-    Loads and aggregates the source data, calculates observation gaps,
-    analyses state transitions, compares short-gap transitions, and
-    summarises observed state-run durations.
+    Runs the following processing stages:
+
+    1. Load and aggregate the source occupancy records.
+    2. Calculate observation gaps.
+    3. Analyse observation-gap distributions.
+    4. Calculate all-gap state transitions.
+    5. Analyse short-gap state transitions.
+    6. Calculate observed state-run durations.
+    7. Export the aggregated five-minute observations.
+
+    Outputs:
+        All generated CSV files are saved to OUTPUT_DIR.
     """
     print("=" * 65)
     print("OCCUPANCY TIMING AND TRANSITION ANALYSIS")

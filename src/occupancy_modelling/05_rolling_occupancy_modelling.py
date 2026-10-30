@@ -1,17 +1,41 @@
-from pathlib import Path
+"""Evaluate occupancy forecasting using expanding chronological windows.
 
-"""Evaluate occupancy forecasting with expanding chronological windows.
+The script aggregates occupancy sensor readings into five-minute intervals,
+constructs features using current and previous observations, and predicts
+the occupancy state in the exact next five-minute interval.
 
-The script aggregates sensor readings into five-minute bins, predicts the
-state in the next bin, and compares a Random Forest with two simple baselines.
-It writes separate evaluation outputs and does not overwrite the main forecast
-pipeline's files.
+A Random Forest classifier is evaluated against two simple baselines:
+a majority-class baseline and a persistence baseline. Evaluation uses three
+expanding chronological windows, with training targets preceding the
+corresponding test period.
+
+The script saves evaluation metrics, individual predictions, and forecast
+row counts to a dedicated output directory. It does not overwrite the main
+forecast pipeline's outputs.
 
 Important assumptions:
-    - The latest observation in each floor-space/bin represents that bin.
+    - The latest observation in each floor-space/time bin represents that bin.
     - A target exists only when the exact next five-minute bin is present.
-    - Features are calculated from the current and earlier observations only.
-    - Windows are split by target timestamp, so training targets precede tests.
+    - Features are calculated using current and earlier observations only.
+    - Windows are split by target timestamp, ensuring training targets precede
+      test targets.
+    - The persistence baseline predicts that the current state will continue
+      into the next interval.
+    - The majority baseline always predicts the most common training class.
+
+Outputs:
+    - rolling_evaluation_metrics.csv:
+        Evaluation metrics for each model and chronological window.
+    - rolling_evaluation_predictions.csv:
+        Actual and predicted occupancy states for each evaluated row.
+    - rolling_evaluation_row_counts.csv:
+        Counts describing target matching and forecast-row eligibility.
+
+Notes:
+    This script evaluates recorded occupancy sensor states rather than
+    independently verified physical occupancy. A nominal five-minute target
+    interval does not necessarily represent exactly five minutes of elapsed
+    time between the original sensor observations.
 """
 
 from pathlib import Path
@@ -79,7 +103,35 @@ RANDOM_FOREST_SETTINGS = {
 
 
 def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
-    """Read valid occupancy rows from the single CSV in the ZIP archive."""
+    """Load and aggregate valid occupancy observations from a ZIP archive.
+
+    Reads the source CSV in chunks to limit the amount of data loaded at once.
+    Invalid rows with missing floor-space identifiers, occupancy states, or
+    timestamps are removed. Timestamps are converted to UTC and assigned to
+    five-minute intervals.
+
+    When multiple observations exist for the same floor space and interval,
+    only the latest source observation is retained.
+
+    Args:
+        zip_path: Path to the ZIP archive containing the occupancy CSV.
+
+    Returns:
+        A DataFrame containing one observation per floor space and
+        five-minute interval, sorted chronologically within each floor space.
+        The DataFrame includes the original observation timestamp and the
+        corresponding interval timestamp.
+
+    Raises:
+        FileNotFoundError: If the specified ZIP archive does not exist.
+        ValueError: If the archive does not contain exactly one CSV file,
+            contains no data rows, or contains no valid observations.
+
+    Note:
+        The interval timestamp is calculated by flooring the original
+        observation timestamp to a five-minute boundary. It is not a
+        replacement for the original sensor timestamp.
+    """
     if not zip_path.is_file():
         raise FileNotFoundError(f"Input ZIP file not found: {zip_path}")
 
@@ -136,10 +188,38 @@ def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
 
 
 def build_forecast_rows(data: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Create features and match each row to its exact next five-minute bin.
+    """Construct forecasting features and match exact next-interval targets.
+
+    Each aggregated observation becomes a candidate forecast origin. Features
+    are constructed from the current observation, the previous observation
+    for the same floor space, and the timestamp of the current interval.
+
+    The target is obtained by matching the current row to an observation
+    belonging to the exact next five-minute interval for the same floor
+    space. Rows without a matching target, previous state, or valid
+    observation-gap feature are excluded from the eligible dataset.
+
+    Args:
+        data: Aggregated occupancy observations containing floor-space IDs,
+            occupancy states, original timestamps, and interval timestamps.
 
     Returns:
-        A table of eligible forecast rows and counts describing target matching.
+        A tuple containing:
+
+        - A DataFrame of eligible forecast rows, including the engineered
+          features and the matched future occupancy state in ``TARGET``.
+        - A dictionary of row counts describing the target-matching and
+          eligibility process.
+
+    Note:
+        The target is matched using the interval timestamp, not by selecting
+        the next available observation. Consequently, an observation is
+        excluded if the exact next five-minute bin is absent.
+
+        The observation-gap feature uses the original ``collecteddate``
+        timestamps. It is therefore possible for the elapsed time between
+        sensor observations to differ from five minutes, even when their
+        interval timestamps are consecutive.
     """
     data = data.copy()
     data["current_state"] = data[TARGET]
@@ -203,7 +283,22 @@ def build_forecast_rows(data: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
 
 def make_model() -> Pipeline:
-    """Build the preprocessing and Random Forest pipeline."""
+    """Create the preprocessing and Random Forest classification pipeline.
+
+    Categorical features are imputed using their most frequent values and
+    one-hot encoded. Numeric features are imputed using their median values.
+    The transformed features are then passed to a Random Forest classifier.
+
+    Returns:
+        A scikit-learn Pipeline containing the preprocessing transformer
+        and configured Random Forest classifier.
+
+    Note:
+        The one-hot encoder ignores previously unseen categories during
+        prediction. Imputation and encoding are fitted as part of the
+        pipeline, so their parameters are learned from the training data
+        when ``fit`` is called.
+    """
     preprocessing = ColumnTransformer(
         transformers=[
             (
@@ -238,7 +333,34 @@ def make_model() -> Pipeline:
 
 
 def create_windows(data: pd.DataFrame) -> list[dict]:
-    """Create three expanding-window tests using chronological target times."""
+    """Generate three expanding chronological evaluation windows.
+
+    Unique target timestamps are sorted chronologically and divided using
+    cutoffs at 60%, 70%, 80%, and 90% of the available timestamps.
+
+    Each window uses all eligible observations up to the preceding cutoff
+    for training, followed by the next chronological segment for testing.
+    This produces three expanding training sets and three non-overlapping
+    test periods.
+
+    Args:
+        data: Eligible forecast rows containing a ``target_interval``
+            column.
+
+    Returns:
+        A list of three dictionaries. Each dictionary contains the window
+        name and its training-end, test-start, and test-end timestamps.
+
+    Raises:
+        ValueError: If fewer than 100 unique target timestamps are available
+            or if the cutoffs cannot produce non-empty chronological windows.
+
+    Note:
+        Approximately the first 60% of unique target timestamps are used
+        for the first training set. The three test periods cover approximately
+        60–70%, 70–80%, and 80–90% of the timestamps. The final 10% is not
+        included in these evaluation windows.
+    """
     unique_times = np.sort(data["target_interval"].dropna().unique())
     if len(unique_times) < 100:
         raise ValueError(
@@ -261,8 +383,54 @@ def create_windows(data: pd.DataFrame) -> list[dict]:
     ]
 
 
-def evaluate_windows(data: pd.DataFrame, windows: list[dict]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Fit and score each chronological window against two baselines."""
+def evaluate_windows(
+    data: pd.DataFrame,
+    windows: list[dict],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Train and evaluate forecasting models across chronological windows.
+
+    For each window, the function selects training and test rows according
+    to their target timestamps. It then evaluates three prediction
+    approaches:
+
+    - Majority baseline: predicts the most common training target class.
+    - Persistence baseline: predicts that the current state continues
+      into the target interval.
+    - Random Forest: fits the configured classification pipeline using
+      the training data and predicts the test data.
+
+    Accuracy, balanced accuracy, macro F1, and weighted F1 are calculated
+    for each model and window. Individual predictions are also retained
+    for later inspection.
+
+    Args:
+        data: Eligible forecast rows containing the engineered features,
+            target labels, floor-space IDs, and target timestamps.
+        windows: Chronological window definitions generated by
+            ``create_windows``.
+
+    Returns:
+        A tuple containing:
+
+        - A DataFrame of evaluation metrics, with one row per model
+          and completed window.
+        - A DataFrame containing the actual and predicted states for
+          every evaluated test row.
+
+    Raises:
+        ValueError: If chronological overlap is detected between a
+            training and test set.
+        RuntimeError: If no evaluation windows complete successfully.
+
+    Note:
+        Windows with empty training or test sets, or fewer than two
+        training classes, are skipped. Training data expands between
+        windows, while the test periods remain separate.
+
+        The F1 metrics use ``STATE_ORDER`` as the fixed set of class
+        labels. This ensures that the reported macro and weighted F1
+        scores use a consistent class ordering across windows.
+    """
     results = []
     prediction_tables = []
 
@@ -353,7 +521,23 @@ def evaluate_windows(data: pd.DataFrame, windows: list[dict]) -> tuple[pd.DataFr
 
 
 def main() -> None:
-    """Run the rolling evaluation and save metrics, predictions, and audit counts."""
+    """Run the rolling evaluation and save all generated outputs.
+
+    Loads and aggregates the occupancy sensor data, constructs eligible
+    forecasting rows, creates chronological evaluation windows, and
+    evaluates the majority baseline, persistence baseline, and Random
+    Forest classifier.
+
+    The function saves the evaluation metrics, individual predictions,
+    and row-count summary to ``OUTPUT_DIR`` before printing a summary
+    of the completed evaluation.
+
+    Raises:
+        FileNotFoundError: If the configured input ZIP file is missing.
+        ValueError: If the input data is invalid, no eligible forecast
+            rows are generated, or chronological windows cannot be created.
+        RuntimeError: If no evaluation windows complete successfully.
+    """
     print("=" * 70)
     print("ROLLING CHRONOLOGICAL OCCUPANCY FORECAST EVALUATION")
     print("=" * 70)

@@ -1,13 +1,15 @@
+
 """Create diagnostic plots for the occupancy-state forecasting models.
 
 The script reads the held-out forecast predictions and model summary CSV files
 created by the forecasting pipeline. It writes confusion matrices, model
 comparison plots, feature-importance plots, class-level F1 scores, a sample
-time-series plot, and a text summary to ``outputs/occupancy_forecast_visualisations``.
+time-series plot, and a text summary to
+``outputs/occupancy_forecast_visualisations``.
 
 Run this script from any working directory using the Python environment that
-contains pandas, NumPy, Matplotlib, and scikit-learn. Paths are resolved relative
-to this file, not the current working directory.
+contains pandas, NumPy, Matplotlib, and scikit-learn. Paths are resolved
+relative to this file, not the current working directory.
 
 Important interpretation notes:
     - The target values are recorded sensor states, not independently verified
@@ -78,12 +80,22 @@ FIGURE_FILENAMES = [
 # ---------------------------------------------------------------------------
 
 def require_columns(dataframe, required_columns, file_path):
-    """Raise a helpful error if a CSV is missing required columns.
+    """Validate that a DataFrame contains all columns required for analysis.
+
+    Compares the supplied column names against the DataFrame's columns.
+    Raises an informative error if one or more required columns are missing.
 
     Args:
-        dataframe: DataFrame loaded from the CSV.
-        required_columns: Column names needed by the analysis.
-        file_path: Source file, used to make the error message informative.
+        dataframe (pd.DataFrame): DataFrame loaded from an input CSV file.
+        required_columns (list[str]): Column names required by the analysis.
+        file_path (Path): Path to the source file, included in the error
+            message to identify which input requires attention.
+
+    Raises:
+        ValueError: If one or more required columns are absent.
+
+    Returns:
+        None.
     """
     missing = sorted(set(required_columns) - set(dataframe.columns))
     if missing:
@@ -93,11 +105,31 @@ def require_columns(dataframe, required_columns, file_path):
 
 
 def load_inputs():
-    """Load and validate the forecast outputs needed to create the plots.
+    """Load and validate the forecasting outputs used by the visualisations.
+
+    Reads the held-out prediction results, model comparison metrics, and
+    Random Forest feature importance values from the forecasting pipeline.
+    Validates the required columns and removes prediction rows containing
+    missing labels, missing floor-space identifiers, or invalid timestamps.
+
+    Forecast timestamps are parsed as UTC. State labels are converted to
+    strings to ensure consistent comparisons throughout the analysis.
 
     Returns:
-        Tuple containing cleaned predictions, model comparison, and feature
-        importance DataFrames.
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+            - predictions: Cleaned held-out predictions.
+            - comparison: Model evaluation metrics.
+            - importance: Random Forest feature importance values.
+
+    Raises:
+        FileNotFoundError: If any of the three required input CSV files
+            cannot be found.
+        ValueError: If an input file is missing required columns or no valid
+            prediction rows remain after cleaning.
+
+    Note:
+        The function validates the presence of required columns but does not
+        independently verify the correctness of the forecasting results.
     """
     for path in (PREDICTIONS_FILE, COMPARISON_FILE, IMPORTANCE_FILE):
         if not path.is_file():
@@ -149,10 +181,26 @@ def load_inputs():
 
 
 def get_state_labels(actual, *predicted_series):
-    """Return the preferred state order plus any unexpected observed labels.
+    """Determine the class labels used in the diagnostic plots.
 
-    Including labels seen only in predictions prevents those predictions from
-    silently disappearing from a confusion matrix.
+    Starts with the preferred occupancy-state order defined by STATE_ORDER.
+    Any additional labels found in the actual or predicted values are appended
+    alphabetically. This ensures unexpected labels are represented in
+    confusion matrices and class-level F1 calculations rather than omitted.
+
+    Args:
+        actual (pd.Series): Actual future occupancy-state labels.
+        *predicted_series (pd.Series): One or more series containing predicted
+            occupancy-state labels.
+
+    Returns:
+        list[str]: Unique state labels, with recognised states in STATE_ORDER
+        followed by any additional labels in alphabetical order.
+
+    Note:
+        Unexpected labels are included in the evaluation outputs, but the
+        representative time-series plot only assigns numeric positions to
+        states defined in STATE_ORDER.
     """
     observed = set(actual.dropna().astype(str))
     for series in predicted_series:
@@ -168,11 +216,36 @@ def get_state_labels(actual, *predicted_series):
 # ---------------------------------------------------------------------------
 
 def plot_confusion_matrices(actual, predicted, labels):
-    """Save raw-count and row-normalised Random Forest confusion matrices.
+    """Generate and save raw-count and row-normalised confusion matrices.
+
+    Calculates a confusion matrix comparing the actual future occupancy
+    states against Random Forest predictions. Two figures are generated:
+
+    1. A raw-count confusion matrix showing the number of predictions in
+       each actual/predicted class combination.
+    2. A row-normalised confusion matrix showing the proportion of each
+       actual class assigned to each predicted class.
 
     Rows represent actual classes and columns represent predicted classes.
-    Row normalisation makes the proportion correctly or incorrectly classified
-    within each actual class easier to compare despite class imbalance.
+    Row normalisation makes classification performance easier to compare
+    between classes with different numbers of observations.
+
+    Args:
+        actual (pd.Series): Actual future occupancy-state labels.
+        predicted (pd.Series): Random Forest predicted occupancy-state labels.
+        labels (list[str]): Ordered class labels used for both matrix axes.
+
+    Returns:
+        None.
+
+    Outputs:
+        Saves two PNG files to OUTPUT_DIR:
+            - 01_random_forest_confusion_matrix.png
+            - 02_normalised_confusion_matrix.png
+
+    Note:
+        Empty actual-class rows remain zero in the normalised matrix to avoid
+        division-by-zero errors.
     """
     matrix = confusion_matrix(actual, predicted, labels=labels)
 
@@ -258,7 +331,31 @@ def plot_confusion_matrices(actual, predicted, labels):
 # ---------------------------------------------------------------------------
 
 def plot_model_comparison(comparison):
-    """Plot the saved evaluation metrics for each model."""
+    """Generate a bar chart comparing the forecasting models.
+
+    Reshapes the model comparison DataFrame into a long format and plots the
+    evaluation metrics for each model. The chart includes accuracy, balanced
+    accuracy, macro F1, and weighted F1.
+
+    All metrics are displayed on a common vertical scale from zero to one.
+
+    Args:
+        comparison (pd.DataFrame): Model comparison results containing a
+            model identifier and the metric columns defined in METRIC_COLUMNS.
+
+    Returns:
+        None.
+
+    Outputs:
+        Saves ``03_model_comparison.png`` to OUTPUT_DIR.
+
+    Raises:
+        ValueError: If the supplied model comparison DataFrame is empty.
+
+    Note:
+        This function visualises the metrics supplied by the forecasting
+        pipeline. It does not recalculate or independently validate them.
+    """
     if comparison.empty:
         raise ValueError(f"Model comparison file is empty: {COMPARISON_FILE}")
 
@@ -294,10 +391,33 @@ def plot_model_comparison(comparison):
 # ---------------------------------------------------------------------------
 
 def plot_feature_importance(importance):
-    """Plot the 15 highest-importance features from the saved model output.
+    """Plot the 15 highest-importance Random Forest features.
 
-    Feature importance is a model diagnostic: it should not be interpreted as
-    evidence that a feature causes a particular occupancy state.
+    Converts the importance column to numeric values, removes rows with
+    missing or invalid feature-importance values, and selects the 15 features
+    with the highest importance scores.
+
+    The selected features are displayed in ascending order in a horizontal
+    bar chart so that the highest-importance feature appears at the top.
+
+    Args:
+        importance (pd.DataFrame): Feature importance results containing
+            ``feature`` and ``importance`` columns.
+
+    Returns:
+        bool:
+            - True if the feature-importance figure was successfully created.
+            - False if the input is empty or contains no valid numeric
+              importance values.
+
+    Outputs:
+        Saves ``04_feature_importance.png`` to OUTPUT_DIR when valid data
+        are available.
+
+    Note:
+        Feature importance describes how the fitted Random Forest model uses
+        its input features. It does not establish a causal relationship between
+        a feature and an occupancy state.
     """
     if importance.empty:
         print("Skipping feature-importance plot: no rows are available.")
@@ -338,16 +458,25 @@ def plot_feature_importance(importance):
 # ---------------------------------------------------------------------------
 
 def calculate_class_f1(actual, predicted, state):
-    """Calculate the F1 score for one class using one-vs-rest counts.
+    """Calculate the one-vs-rest F1 score for a specified occupancy state.
+
+    Treats the selected state as the positive class and all other states as
+    the negative class. Calculates true positives, false positives, and false
+    negatives before applying the F1-score formula.
 
     Args:
-        actual: Actual state labels.
-        predicted: Predicted state labels.
-        state: Class whose F1 score is being calculated.
+        actual (array-like): Actual occupancy-state labels.
+        predicted (array-like): Predicted occupancy-state labels.
+        state (str): Occupancy state for which the F1 score is calculated.
 
     Returns:
-        F1 score between 0 and 1. Returns zero when precision and recall are
-        both undefined because the denominator is zero.
+        float: F1 score between zero and one. Returns zero when the
+        denominator is zero, meaning no positive predictions or actual
+        examples are available for the selected state.
+
+    Note:
+        This calculation evaluates one class at a time. It is not the
+        macro-averaged or weighted F1 score across all classes.
     """
     actual = np.asarray(actual)
     predicted = np.asarray(predicted)
@@ -361,7 +490,31 @@ def calculate_class_f1(actual, predicted, state):
 
 
 def plot_class_level_f1(actual, rf_pred, persistence_pred, labels):
-    """Save per-state F1 scores to CSV and compare the two forecasting models."""
+    """Calculate, export, and compare per-class F1 scores.
+
+    Calculates a one-vs-rest F1 score for each occupancy state using both
+    the Random Forest and persistence predictions. Stores the results in
+    a CSV file and generates a grouped bar chart comparing the models.
+
+    Args:
+        actual (pd.Series): Actual future occupancy-state labels.
+        rf_pred (pd.Series): Random Forest predicted occupancy-state labels.
+        persistence_pred (pd.Series): Persistence predicted occupancy-state
+            labels.
+        labels (list[str]): Occupancy-state labels to evaluate.
+
+    Returns:
+        None.
+
+    Outputs:
+        Saves the following files to OUTPUT_DIR:
+            - class_level_f1_scores.csv
+            - 05_class_level_f1_comparison.png
+
+    Note:
+        Each class is evaluated independently using a one-vs-rest calculation.
+        A score of zero is returned when the F1 denominator is zero.
+    """
     results = []
     for state in labels:
         results.append(
@@ -395,17 +548,39 @@ def plot_class_level_f1(actual, rf_pred, persistence_pred, labels):
 # ---------------------------------------------------------------------------
 
 def plot_representative_time_series(predictions):
-    """Plot and export a representative 48-hour window for one floor space.
+    """Plot and export a representative 48-hour forecast comparison.
 
-    The floor space with the most test examples is selected for convenience.
-    If multiple forecast origins exist for one target timestamp, the last row
-    after sorting is retained to avoid plotting multiple values at one time.
-    The resulting plot is illustrative and is not a substitute for aggregate
-    model metrics.
-    
+    Selects the floor space with the largest number of held-out prediction
+    examples. Sorts its predictions by target timestamp and retains the last
+    row when multiple forecast origins correspond to the same target time.
+
+    A 48-hour window is then selected around the middle timestamp in the
+    available data. The actual future state, Random Forest prediction, and
+    persistence prediction are plotted using step plots.
+
+    Args:
+        predictions (pd.DataFrame): Cleaned prediction results containing
+            forecast target timestamps, actual states, model predictions,
+            and floor-space identifiers.
+
     Returns:
-        A tuple containing the selected floor-space ID and number of plotted
-        rows, or (None, 0) if no usable time-series rows are available.
+        tuple:
+            - selected_floor: Identifier of the selected floor space, or
+              None if no floor-space identifiers are available.
+            - plotted_rows (int): Number of rows included in the time-series
+              plot. Returns zero if no usable rows remain.
+
+    Outputs:
+        Saves the following files to OUTPUT_DIR when usable data are
+        available:
+            - 06_actual_vs_predicted_time_series.png
+            - representative_time_series.csv
+
+    Note:
+        The selected floor space and 48-hour window are illustrative only.
+        They do not represent overall model performance. Unexpected state
+        labels are not assigned numeric positions and therefore appear as
+        gaps in the plotted series.
     """
     print("Creating time-series comparison...")
 
@@ -502,7 +677,25 @@ def plot_representative_time_series(predictions):
 # ---------------------------------------------------------------------------
 
 def write_summary(predictions, generated_figures):
-    """Write a text summary of the input size and outputs generated."""
+    """Write a text summary describing the visualisation outputs.
+
+    Records the number of held-out prediction rows, the number of distinct
+    floor spaces represented, the output directory, and the figure files
+    generated during the current execution. Includes interpretation notes
+    about recorded sensor states, feature importance, the representative
+    time-series plot, and UTC timestamps.
+
+    Args:
+        predictions (pd.DataFrame): Cleaned held-out prediction results.
+        generated_figures (list[str]): Filenames of figures successfully
+            generated during the current execution.
+
+    Returns:
+        None.
+
+    Outputs:
+        Writes ``visualisation_summary.txt`` to OUTPUT_DIR.
+    """
     summary_lines = [
         "OCCUPANCY FORECAST VISUALISATION SUMMARY",
         "=" * 45,
@@ -525,7 +718,31 @@ def write_summary(predictions, generated_figures):
 
 
 def main():
-    """Run validation, generate all available visualisations, and save a summary."""
+    """Execute the occupancy forecast visualisation workflow.
+
+    Creates the output directory, loads and validates the forecasting
+    results, determines the occupancy-state labels, and generates the
+    available diagnostic figures.
+
+    The workflow produces confusion matrices, a model comparison chart,
+    a feature-importance chart when valid data are available, class-level
+    F1 scores, and a representative time-series plot when usable data exist.
+    A text summary records the outputs generated.
+
+    Returns:
+        None.
+
+    Raises:
+        FileNotFoundError: If one or more required forecasting output files
+            are missing.
+        ValueError: If required input columns are missing, no valid
+            prediction rows remain, or the model comparison data are empty.
+
+    Note:
+        Optional visualisations are skipped when their input data are
+        unavailable. The script is executed through the main guard so that
+        importing the module for documentation does not run the workflow.
+    """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
@@ -579,4 +796,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
