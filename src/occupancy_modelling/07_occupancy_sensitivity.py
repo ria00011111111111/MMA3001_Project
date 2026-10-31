@@ -1,18 +1,56 @@
+"""Evaluate the sensitivity of occupancy forecasting to Random Forest settings.
 
-"""Evaluate Random Forest hyperparameter sensitivity for occupancy forecasting.
+The script investigates how different Random Forest hyperparameter
+configurations affect occupancy forecasting performance.
 
-Compares nine Random Forest configurations using a chronological
-training-validation split. Predictions target the recorded occupancy state
-at the next five-minute interval, not necessarily five minutes after the
-original sensor observation.
+Sensor observations are aggregated into five-minute intervals and matched
+to observations in the exact next five-minute interval to construct
+forecasting pairs. Features are generated using current and previous
+observations, and the resulting dataset is split chronologically into
+training and validation periods.
 
-The validation period ends before the original test-period cutoff.
+The evaluation compares:
+    - A majority-class baseline.
+    - A persistence baseline.
+    - Nine Random Forest configurations using combinations of maximum
+      tree depth and minimum samples per leaf.
+
+The Random Forest configurations are evaluated using a fixed validation
+period. Performance is measured using accuracy, balanced accuracy,
+macro F1, weighted F1, and per-class precision, recall, and F1-score.
 
 Outputs:
-    outputs/occupancy_sensitivity/sensitivity_summary.csv
-    outputs/occupancy_sensitivity/sensitivity_class_metrics.csv
-    outputs/occupancy_sensitivity/sensitivity_validation_predictions.csv
-    outputs/occupancy_sensitivity/sensitivity_report.txt
+    outputs/occupancy_sensitivity/sensitivity_summary.csv:
+        Overall evaluation metrics for each model configuration.
+
+    outputs/occupancy_sensitivity/sensitivity_class_metrics.csv:
+        Per-class evaluation metrics for each model configuration.
+
+    outputs/occupancy_sensitivity/sensitivity_validation_predictions.csv:
+        Actual and predicted occupancy states for validation observations.
+
+    outputs/occupancy_sensitivity/sensitivity_report.txt:
+        Text summary of the evaluation, including the best-performing
+        Random Forest configuration according to validation macro F1.
+
+Important assumptions:
+    - The latest observation in each floor-space/five-minute bin represents
+      that interval.
+    - A forecasting target exists only when the exact next five-minute
+      interval is present.
+    - Features are calculated from current and previous observations only.
+    - Training and validation sets are separated chronologically by
+      target timestamp.
+    - The original test period is excluded from both training and validation.
+    - Model selection is based on validation performance, not independent
+      test performance.
+
+Notes:
+    The best Random Forest configuration is selected using validation
+    macro F1. Its validation score is not an independent final test result.
+
+    The script evaluates recorded occupancy sensor states rather than
+    independently verified physical occupancy.
 """
 
 from pathlib import Path
@@ -108,7 +146,36 @@ MODEL_COLUMNS = [
 # ---------------------------------------------------------------------
 
 def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
-    """Read sensor records and retain the latest record per five-minute bin."""
+    """Load and aggregate occupancy sensor records from a ZIP archive.
+
+    Reads the occupancy CSV in chunks to limit memory usage. Each chunk
+    is cleaned by removing records with missing floor-space identifiers,
+    occupancy states, or timestamps. Timestamps are converted to UTC
+    and assigned to five-minute intervals.
+
+    Within each chunk, duplicate floor-space/interval records are resolved
+    by retaining the latest observation. A second deduplication step
+    resolves duplicates that occur across different chunks.
+
+    Args:
+        zip_path: Path to the ZIP archive containing the occupancy
+            sensor CSV file.
+
+    Returns:
+        A DataFrame containing one observation per floor space and
+        five-minute interval. The output includes the original observation
+        timestamp, interval timestamp, occupancy state, and source-order
+        index. Records are sorted by floor space and interval.
+
+    Raises:
+        ValueError: If the ZIP archive contains no CSV files, if required
+            columns are missing, or if no usable occupancy records remain.
+
+    Note:
+        If multiple CSV files are present, the first CSV listed in the
+        archive is used. The source-order index provides a consistent
+        way to resolve records with identical timestamps.
+    """
     required_columns = {
         "floorspaceid",
         "occupancystatus",
@@ -232,7 +299,40 @@ def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
 
 
 def build_forecast_pairs(intervals: pd.DataFrame) -> pd.DataFrame:
-    """Create features and match each observation to its exact next bin."""
+    """Construct forecasting features and match exact next-interval targets.
+
+    For each floor space, the function identifies the previous occupancy
+    state and previous interval. It then calculates the observation gap
+    and derives calendar-based features from the current interval.
+
+    Each observation is matched to the occupancy state for the exact
+    next five-minute interval. Rows without a matching target or valid
+    feature values are excluded.
+
+    The original test period is also excluded so that it remains separate
+    from model training and validation.
+
+    Args:
+        intervals: Aggregated occupancy observations containing floor-space
+            identifiers, occupancy states, original timestamps, and
+            interval timestamps.
+
+    Returns:
+        A DataFrame of eligible forecasting pairs containing the engineered
+        features, current occupancy state, target occupancy state, and
+        target interval.
+
+    Raises:
+        ValueError: If no eligible forecasting pairs remain before the
+            test cutoff or if unexpected occupancy labels are encountered.
+
+    Note:
+        Target matching is performed using the exact next five-minute
+        interval, rather than the next available observation.
+
+        The observation-gap feature is calculated using interval timestamps,
+        not the original sensor collection timestamps.
+    """
     intervals = intervals.copy()
 
     grouped = intervals.groupby("floorspaceid")
@@ -316,7 +416,36 @@ def build_forecast_pairs(intervals: pd.DataFrame) -> pd.DataFrame:
 def chronological_split(
     data: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split by target timestamp to prevent time overlap between sets."""
+    """Split forecasting pairs into chronological training and validation sets.
+
+    Unique target timestamps are sorted and divided according to
+    ``VALIDATION_FRACTION``. All rows with target timestamps before the
+    validation start are assigned to training. Rows at or after the
+    validation start are assigned to validation.
+
+    Splitting by target timestamp ensures that observations belonging
+    to the same target time are not divided between the two sets.
+
+    Args:
+        data: Eligible forecasting pairs containing a ``target_interval``
+            column.
+
+    Returns:
+        A tuple containing:
+
+        - The chronological training DataFrame.
+        - The subsequent validation DataFrame.
+
+    Raises:
+        ValueError: If there are too few unique target timestamps or if
+            either resulting dataset is empty or chronological overlap
+            is detected.
+
+    Note:
+        The original test cutoff is reported but is not used to construct
+        the validation split. The cutoff has already been applied during
+        forecast-pair construction.
+    """
     unique_times = np.sort(data["target_interval"].unique())
 
     if len(unique_times) < 10:
@@ -368,7 +497,36 @@ def evaluate_predictions(
     train_rows: int,
     validation_rows: int,
 ) -> tuple[dict, list[dict]]:
-    """Calculate overall and per-class metrics for one model."""
+    """Calculate overall and per-class metrics for a set of predictions.
+
+    Computes accuracy, balanced accuracy, macro F1, and weighted F1
+    for the supplied predictions. A classification report is also
+    generated to obtain precision, recall, F1-score, and support
+    for each occupancy class.
+
+    Args:
+        model_name: Descriptive name of the model or baseline.
+        predictions: Predicted occupancy states for the validation rows.
+        y_val: Actual occupancy states for the validation rows.
+        depth: Maximum tree depth for a Random Forest configuration.
+            Use ``None`` for baseline models.
+        leaf_size: Minimum samples per leaf for a Random Forest
+            configuration. Use ``None`` for baseline models.
+        train_rows: Number of observations used for model training.
+        validation_rows: Number of observations used for validation.
+
+    Returns:
+        A tuple containing:
+
+        - A dictionary of overall evaluation metrics and model settings.
+        - A list of dictionaries containing per-class metrics.
+
+    Note:
+        The fixed ``STATE_ORDER`` ensures that F1 metrics are calculated
+        consistently across model configurations. The
+        ``zero_division=0`` setting assigns zero when a metric would
+        otherwise be undefined.
+    """
     summary_row = {
         "model": model_name,
         "max_depth": depth,
@@ -428,7 +586,30 @@ def evaluate_predictions(
 
 
 def build_model(depth: int, leaf_size: int) -> Pipeline:
-    """Create a preprocessing and Random Forest pipeline."""
+    """Create a preprocessing and Random Forest classification pipeline.
+
+    Categorical features are one-hot encoded, with previously unseen
+    categories ignored during transformation. Numeric features are passed
+    directly to the classifier without additional transformation.
+
+    The Random Forest is configured using the supplied maximum tree depth
+    and minimum samples per leaf, alongside the shared estimator count,
+    class weighting, and random state.
+
+    Args:
+        depth: Maximum depth of each decision tree in the Random Forest.
+        leaf_size: Minimum number of training samples required at a leaf
+            node.
+
+    Returns:
+        A scikit-learn Pipeline containing the feature preprocessor and
+        configured Random Forest classifier.
+
+    Note:
+        The preprocessing transformer is fitted as part of the pipeline,
+        ensuring that categorical encoding is learned from the training
+        data when ``fit`` is called.
+    """
     preprocessor = ColumnTransformer(
         transformers=[
             (
@@ -469,7 +650,37 @@ def save_results(
     predictions_by_model: dict[str, np.ndarray],
     validation: pd.DataFrame,
 ) -> None:
-    """Save sensitivity metrics, predictions, and a text report."""
+    """Save sensitivity metrics, validation predictions, and a text report.
+
+    Converts the overall and per-class metric records into DataFrames,
+    sorts the overall results by macro F1 and balanced accuracy, and
+    writes the resulting CSV files to ``OUTPUT_DIR``.
+
+    Validation predictions from each model are added to a copy of the
+    validation data before being saved. A text report summarises the
+    evaluation period, model metrics, and best Random Forest configuration.
+
+    Args:
+        summary_rows: Overall evaluation metric dictionaries for all
+            baselines and Random Forest configurations.
+        class_rows: Per-class metric dictionaries for all evaluated models.
+        predictions_by_model: Dictionary mapping model names to their
+            validation predictions.
+        validation: Validation DataFrame containing the original
+            identifiers, timestamps, current states, and target states.
+
+    Returns:
+        None. Results are written to CSV and text files.
+
+    Raises:
+        ValueError: If no Random Forest results are available for selecting
+            the best configuration.
+
+    Note:
+        The best Random Forest configuration is selected using validation
+        macro F1. This is a model-selection result and should not be
+        interpreted as an independent final test result.
+    """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     summary = pd.DataFrame(summary_rows).sort_values(
@@ -573,7 +784,26 @@ def save_results(
 # ---------------------------------------------------------------------
 
 def main() -> None:
-    """Run the occupancy forecasting sensitivity analysis."""
+    """Run the occupancy forecasting sensitivity analysis.
+
+    Loads and aggregates the occupancy sensor data, constructs eligible
+    forecasting pairs, and creates a chronological training/validation
+    split.
+
+    The function first evaluates the majority and persistence baselines.
+    It then trains and evaluates each Random Forest configuration defined
+    by ``DEPTH_VALUES`` and ``LEAF_VALUES``.
+
+    Finally, it saves the overall metrics, per-class metrics, validation
+    predictions, and text report.
+
+    Raises:
+        FileNotFoundError: If the configured input ZIP archive does not
+            exist.
+        ValueError: If the input data cannot be processed, no eligible
+            forecast pairs remain, an invalid occupancy state is found,
+            or the chronological split cannot be created.
+    """
     print("=" * 70)
     print("OCCUPANCY FORECAST SENSITIVITY ANALYSIS")
     print("=" * 70)
