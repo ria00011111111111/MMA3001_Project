@@ -29,7 +29,8 @@ Important interpretation notes:
 """
 
 from pathlib import Path
-
+import sys
+sys.dont_write_bytecode = True
 import numpy as np
 import pandas as pd
 
@@ -163,7 +164,7 @@ def audit_forecast_horizon(data):
     data = data.copy()
 
     data["nominal_horizon_minutes"] = (
-        data["forecast_target_time"] - data["forecast_origin"]
+        data["forecast_origin"] - data["collecteddate"]
     ).dt.total_seconds() / 60
 
     print("\n1. NOMINAL FORECAST HORIZON")

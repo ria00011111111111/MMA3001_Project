@@ -55,7 +55,8 @@ Notes:
 
 from pathlib import Path
 from zipfile import ZipFile
-
+import sys
+sys.dont_write_bytecode = True
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer

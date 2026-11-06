@@ -28,7 +28,8 @@ Notes:
 """
 
 from pathlib import Path
-
+import sys
+sys.dont_write_bytecode = True
 import pandas as pd
 from sklearn.metrics import classification_report
 

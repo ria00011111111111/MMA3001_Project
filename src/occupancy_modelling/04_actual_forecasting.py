@@ -32,7 +32,8 @@ Important interpretation notes:
 
 from pathlib import Path
 from zipfile import ZipFile
-
+import sys
+sys.dont_write_bytecode = True
 import pandas as pd
 
 

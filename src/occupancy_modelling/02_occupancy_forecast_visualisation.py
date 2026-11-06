@@ -17,7 +17,8 @@ independently verified measurement of physical occupancy.
 
 from pathlib import Path
 from zipfile import ZipFile
-
+import sys
+sys.dont_write_bytecode = True
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
