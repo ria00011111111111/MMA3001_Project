@@ -1,0 +1,26 @@
+OCCUPANCY FORECAST VISUALISATION SUMMARY
+=============================================
+Test forecast pairs: 73,773
+Floor spaces represented: 4
+Forecast output directory: C:\Users\riaku\MMA3001_Project\outputs\occupancy_forecast_v2
+Visualisation output directory: C:\Users\riaku\MMA3001_Project\outputs\occupancy_forecast_visualisations
+
+Forecast definition:
+- Each forecast predicts the next consecutive five-minute interval.
+- Features are available at the forecast origin.
+- Non-consecutive observations are excluded from forecast pairing.
+- Training targets finish before the test forecast period.
+
+Generated figures:
+01_random_forest_confusion_matrix.png
+02_normalised_confusion_matrix.png
+03_model_comparison.png
+04_feature_importance.png
+05_class_level_f1_comparison.png
+06_actual_vs_predicted_time_series.png
+
+Interpretation notes:
+- Recorded sensor states are not independently verified physical occupancy.
+- Feature importance describes model behaviour, not causation.
+- The time-series chart is representative, not an aggregate metric.
+- All timestamps are shown in UTC.

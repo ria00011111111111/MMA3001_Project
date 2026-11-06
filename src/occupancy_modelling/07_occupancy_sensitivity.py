@@ -80,7 +80,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ZIP_PATH = (
     PROJECT_ROOT
     / "data"
-    / "5occupancySensor_MayToDec2024_9MRows (1).zip"
+    / "5occupancySensor_MayToDec2024_9MRows.zip"
 )
 
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "occupancy_sensitivity"

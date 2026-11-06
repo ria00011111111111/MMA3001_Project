@@ -1,6 +1,6 @@
 OCCUPANCY MODELLING TEST REPORT
 ========================================
-Execution date: 2026-11-01 01:39:55.276097+11:00
+Execution date: 2026-11-06 16:43:00.075830+11:00
 
 test_confusion_matrix_counts_correct_predictions (test_class_analysis.TestClassAnalysis.test_confusion_matrix_counts_correct_predictions) ... ok
 test_recall_for_each_class (test_class_analysis.TestClassAnalysis.test_recall_for_each_class) ... ok
@@ -30,7 +30,7 @@ test_perfect_prediction_accuracy (test_validation.TestValidation.test_perfect_pr
 test_perfect_predictions_have_perfect_f1 (test_validation.TestValidation.test_perfect_predictions_have_perfect_f1) ... ok
 
 ----------------------------------------------------------------------
-Ran 26 tests in 0.100s
+Ran 26 tests in 0.132s
 
 OK
 

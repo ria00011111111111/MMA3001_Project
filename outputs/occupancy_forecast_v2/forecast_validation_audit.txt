@@ -1,0 +1,12 @@
+OCCUPANCY FORECAST VALIDATION AUDIT
+Rows checked: 73,773
+Nominal horizon minutes: 5
+Duplicate origins: 0
+Persistence mismatches: 0
+
+IMPORTANT LIMITATION:
+The predictions file does not contain the actual timestamp
+of the future observation used to create each target.
+Therefore, actual elapsed time between the current and future
+sensor observations cannot be verified using this file alone.
+The source data must be reprocessed to audit that interval.

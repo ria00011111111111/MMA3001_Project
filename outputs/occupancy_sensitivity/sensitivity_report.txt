@@ -1,0 +1,32 @@
+OCCUPANCY FORECAST SENSITIVITY ANALYSIS
+============================================================
+
+Validation targets are strictly before the original test cutoff.
+Original test cutoff: 2025-10-21 04:00:00+00:00
+Validation starts: 2025-06-01 04:50:00+00:00
+Validation ends: 2025-10-21 03:55:00+00:00
+
+MODEL SUMMARY, SORTED BY MACRO F1
+------------------------------------------------------------
+                          model  max_depth  min_samples_leaf  train_rows  validation_rows  accuracy  balanced_accuracy  macro_f1  weighted_f1
+  Random Forest depth=8, leaf=5        8.0               5.0      282978            63561  0.682494           0.533762  0.507776     0.711285
+ Random Forest depth=8, leaf=10        8.0              10.0      282978            63561  0.681865           0.534129  0.507731     0.711047
+ Random Forest depth=8, leaf=20        8.0              20.0      282978            63561  0.681692           0.532988  0.507012     0.710874
+Random Forest depth=12, leaf=20       12.0              20.0      282978            63561  0.672110           0.536642  0.505345     0.705992
+Random Forest depth=12, leaf=10       12.0              10.0      282978            63561  0.674171           0.535067  0.505299     0.706470
+ Random Forest depth=12, leaf=5       12.0               5.0      282978            63561  0.675493           0.533231  0.504714     0.707067
+Random Forest depth=16, leaf=20       16.0              20.0      282978            63561  0.666069           0.532384  0.500881     0.701164
+Random Forest depth=16, leaf=10       16.0              10.0      282978            63561  0.669923           0.530184  0.500609     0.701961
+ Random Forest depth=16, leaf=5       16.0               5.0      282978            63561  0.676390           0.525729  0.499805     0.704659
+           Persistence baseline        NaN               NaN      282978            63561  0.691415           0.440220  0.443727     0.685280
+              Majority baseline        NaN               NaN      282978            63561  0.714998           0.333333  0.277939     0.596178
+
+BEST RANDOM FOREST CONFIGURATION
+------------------------------------------------------------
+Model: Random Forest depth=8, leaf=5
+Macro F1: 0.5078
+Balanced accuracy: 0.5338
+Accuracy: 0.6825
+Weighted F1: 0.7113
+
+The best configuration is selected using validation results. Its validation score is not an independent final test result. Inspect class-level metrics, especially RecentlyOccupied, before drawing conclusions.

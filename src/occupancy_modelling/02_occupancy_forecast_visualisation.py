@@ -47,7 +47,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ZIP_FILE = (
     PROJECT_ROOT
     / "data"
-    / "5occupancySensor_MayToDec2024_9MRows (1).zip"
+    / "5occupancySensor_MayToDec2024_9MRows.zip"
 )
 
 INPUT_DIR = PROJECT_ROOT / "outputs" / "occupancy_forecast_v2"
@@ -84,10 +84,12 @@ METRIC_COLUMNS = [
 PREDICTION_COLUMNS = [
     "forecast_origin",
     "forecast_target_time",
+    "collecteddate",
+    "floorspaceid",
+    "current_state",
     "actual_future_state",
     "random_forest_prediction",
     "persistence_prediction",
-    "floorspaceid",
 ]
 
 FIGURE_FILENAMES = [
@@ -612,47 +614,50 @@ def generate_forecast_outputs(data):
         index=False,
     )
 
-    # Assemble the held-out predictions with their forecast origins,
-    # target timestamps and actual future states.
+    # Assemble the held-out predictions.
+    #
+    # Retain the original collection timestamp and current occupancy
+    # state alongside the forecast origin, target time and predictions.
+    # These fields are required by Script 03 for the validation audit.
+
     prediction_output = data.loc[
         test_mask,
         [
             "interval",
             "forecast_target_time",
-            "actual_future_state",
+            "collecteddate",
             "floorspaceid",
+            "current_state",
+            "actual_future_state",
         ],
     ].copy()
 
+    # Rename the five-minute interval to identify the forecast origin.
     prediction_output = prediction_output.rename(
         columns={
             "interval": "forecast_origin",
         }
     )
 
+    # Add Random Forest model predictions.
     prediction_output["random_forest_prediction"] = (
         rf_predictions
     )
 
+    # Add persistence baseline predictions.
     prediction_output["persistence_prediction"] = (
         persistence_predictions
     )
 
+    # Arrange columns according to the required prediction CSV schema.
     prediction_output = prediction_output[
         PREDICTION_COLUMNS
     ]
 
+    # Export held-out predictions for downstream validation.
     prediction_output.to_csv(
         PREDICTIONS_FILE,
         index=False,
-    )
-
-    print("\nFORECAST MODEL COMPARISON")
-    print(
-        comparison.to_string(
-            index=False,
-            float_format="%.4f",
-        )
     )
 
     print("\nForecast CSV files saved:")

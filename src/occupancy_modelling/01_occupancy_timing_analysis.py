@@ -52,7 +52,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ZIP_FILE = (
     PROJECT_ROOT
     / "data"
-    / "5occupancySensor_MayToDec2024_9MRows (1).zip"
+    / "5occupancySensor_MayToDec2024_9MRows.zip"
 )
 
 # Directory for generated CSV files.
