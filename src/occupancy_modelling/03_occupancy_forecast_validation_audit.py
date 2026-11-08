@@ -164,7 +164,7 @@ def audit_forecast_horizon(data):
     data = data.copy()
 
     data["nominal_horizon_minutes"] = (
-        data["forecast_origin"] - data["collecteddate"]
+        data["forecast_target_time"] - data["forecast_origin"]
     ).dt.total_seconds() / 60
 
     print("\n1. NOMINAL FORECAST HORIZON")
