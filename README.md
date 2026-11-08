@@ -1,18 +1,14 @@
-# MMA3001 – Occupancy State Forecasting
+# MMA3001: Occupancy Forecasting Using Machine Learning
 
-## Project Overview
-
-This project investigates the use of machine learning to forecast occupancy states in smart building infrastructure.
-
-Using historical occupancy sensor observations, the project develops a forecasting model to predict the recorded occupancy state of a floor-space at the next consecutive five-minute interval. The aim is to investigate whether temporal and calendar-based information can provide useful predictions of future occupancy and how the resulting model performs against simpler forecasting approaches.
+A machine learning project investigating short-term building occupancy forecasting using historical occupancy sensor observations. The project develops a Random Forest classification model and evaluates its predictive performance against simpler forecasting approaches.
 
 Developed as part of **MMA3001 – Numerical Methods and Machine Learning** at Monash University.
 
-## Engineering Problem
+## 1. Engineering Problem
 
 Building occupancy information can support decisions relating to building operation, resource allocation and infrastructure management. However, occupancy sensor datasets may contain irregular observation intervals, imbalanced occupancy classes and periods with missing consecutive observations.
 
-This project addresses the problem by developing a supervised classification approach that uses historical sensor observations to forecast the next recorded occupancy state.
+This project develops a supervised classification approach to forecast the next recorded occupancy state using historical sensor observations.
 
 **Forecasting objective:** Predict the occupancy state at the next consecutive five-minute interval using information available at the current forecast origin.
 
@@ -24,7 +20,7 @@ The model predicts one of three recorded occupancy states:
 
 The target represents the sensor's recorded classification rather than independently verified physical occupancy.
 
-## Dataset
+## 2. Dataset
 
 The project uses an occupancy sensor dataset containing approximately 9.1 million raw observations.
 
@@ -32,7 +28,9 @@ The project uses an occupancy sensor dataset containing approximately 9.1 millio
 
 The downloaded archive must be placed in the project's `data/` directory with the following filename:
 
-`5occupancySensor_MayToDec2024_9MRows.zip`
+```text
+5occupancySensor_MayToDec2024_9MRows.zip
+```
 
 The dataset is not stored in this Git repository because of its size. It must be downloaded separately before running the complete modelling pipeline.
 
@@ -45,7 +43,7 @@ The original dataset includes fields relating to:
 - Previous occupancy classifications
 - Headcount information
 
-### Data Preprocessing
+### Data preprocessing
 
 The preprocessing workflow:
 
@@ -58,13 +56,13 @@ The preprocessing workflow:
 
 Chunked CSV reading limits the size of each individual read operation. However, retained chunks are subsequently combined for downstream processing, so the complete modelling workflow is not strictly memory-bounded.
 
-After preprocessing, the dataset contains approximately **482,538 aggregated intervals**.
+After preprocessing, the dataset contains approximately 482,538 aggregated intervals.
 
 Only consecutive five-minute observation pairs are retained for the forecasting task. Observations separated by longer gaps are excluded rather than treated as consecutive forecasts.
 
-## Forecasting Methodology
+## 3. Forecasting Methodology
 
-### Input Features
+### Input features
 
 The main Random Forest model uses six input features:
 
@@ -79,14 +77,14 @@ The main Random Forest model uses six input features:
 
 The target variable is the recorded occupancy state at the next consecutive five-minute interval.
 
-The rolling evaluation and sensitivity analysis use additional temporal predictors, including the previous recorded occupancy state and an observation-gap feature. Their feature construction is described in the project report.
+The rolling evaluation and sensitivity analysis use additional temporal predictors, including the previous recorded occupancy state and an observation-gap feature. Their feature construction is described in the project report and corresponding analysis scripts.
 
-### Random Forest Classifier
+### Random Forest classifier
 
 A Random Forest classifier is implemented using Scikit-learn.
 
 | Parameter | Value |
-|---|---:|
+|---|---|
 | Number of trees | 100 |
 | Maximum tree depth | 12 |
 | Minimum samples per leaf | 10 |
@@ -96,7 +94,7 @@ A Random Forest classifier is implemented using Scikit-learn.
 
 Categorical features are one-hot encoded, while numerical calendar features are passed through the preprocessing pipeline.
 
-### Baseline Models
+### Baseline models
 
 Two baseline approaches are used to assess whether the Random Forest provides an improvement over simpler forecasting strategies.
 
@@ -108,7 +106,7 @@ Always predicts the most frequently occurring occupancy state in the training da
 
 Assumes that the next occupancy state will remain unchanged from the current recorded occupancy state.
 
-## Model Evaluation and Validation
+## 4. Model Evaluation and Validation
 
 A chronological training and testing split is used to evaluate forecasting performance.
 
@@ -134,20 +132,20 @@ Additional validation and analysis include:
 
 The evaluation considers both overall predictive performance and the model's ability to identify less frequently occurring occupancy states.
 
-## Project Structure
+## 5. Repository Structure
 
 ```text
 MMA3001_Project/
 │
 ├── data/
 │   └── .gitkeep
-│       └── 5occupancySensor_MayToDec2024_9MRows.zip  (download separately)
 │
 ├── docs/
 │   ├── index.html
 │   ├── occupancy_modelling.html
+│   ├── search.js
 │   └── occupancy_modelling/
-│       └── HTML documentation for the seven analysis scripts
+│       └── HTML documentation for the analysis modules
 │
 ├── outputs/
 │   ├── occupancy_timing_analysis/
@@ -185,25 +183,41 @@ MMA3001_Project/
 └── .gitattributes
 ```
 
-## Installation and Setup
+**Directory descriptions:**
 
-The project uses **Python 3.10 or later** and the following main dependencies:
+| Directory/file | Purpose |
+|---|---|
+| `data/` | Location for the separately downloaded raw dataset |
+| `src/occupancy_modelling/` | Source code for preprocessing, forecasting, evaluation and analysis |
+| `test/` | Automated tests for the modelling workflow and analysis modules |
+| `outputs/` | Generated predictions, evaluation results, figures and analysis outputs |
+| `docs/` | Generated HTML documentation |
+| `run.py` | Entry point for executing the complete analysis pipeline |
+| `requirements.txt` | Python package dependencies |
+| `.gitignore` | Excludes local environments, caches and other files from Git |
+| `.gitattributes` | Defines consistent Git file-handling behaviour |
+
+## 6. Installation and Setup
+
+The project uses Python 3.10 or later. The required Python packages are specified in `requirements.txt`.
+
+Main dependencies include:
 
 - NumPy
 - Pandas
 - Matplotlib
 - Scikit-learn
 
-All required packages are specified in `requirements.txt`.
+The following instructions use Windows PowerShell.
 
-### 1. Clone the repository
+### 6.1 Clone the repository
 
 ```powershell
 git clone https://github.com/ria00011111111111/MMA3001_Project.git
 cd MMA3001_Project
 ```
 
-### 2. Create a virtual environment
+### 6.2 Create a virtual environment
 
 ```powershell
 py -3 -m venv .venv
@@ -215,18 +229,18 @@ Activate the environment:
 .\.venv\Scripts\Activate.ps1
 ```
 
-### 3. Install dependencies
+### 6.3 Install dependencies
 
-Upgrade pip and install the required Python packages:
+Upgrade pip and install the required packages:
 
 ```powershell
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 4. Download the dataset
+### 6.4 Download the dataset
 
-Download the [occupancy sensor dataset](https://drive.google.com/file/d/1NDrTZZYlD7QnbkZbh4w5BwsIyO8lAXIh/view?usp=sharing).
+Download the occupancy sensor dataset from the link in the Dataset section.
 
 Create the data directory if it does not already exist:
 
@@ -240,11 +254,11 @@ Place the downloaded ZIP archive directly inside `data/` and ensure its filename
 5occupancySensor_MayToDec2024_9MRows.zip
 ```
 
-**Do not extract the ZIP archive.** The modelling scripts read the compressed CSV directly.
+Do not extract the ZIP archive. The modelling scripts read the compressed CSV directly.
 
-## Running the Project
+## 7. Running the Project
 
-### Run the complete modelling pipeline
+### 7.1 Run the complete modelling pipeline
 
 From the project root, execute:
 
@@ -255,7 +269,7 @@ python -B .\run.py
 The main runner executes the seven analysis scripts sequentially:
 
 | Order | Script | Purpose |
-|---:|---|---|
+|---|---|---|
 | 1 | `01_occupancy_timing_analysis.py` | Occupancy observation timing and state-transition analysis |
 | 2 | `02_occupancy_forecast_visualisation.py` | Forecast model training, evaluation and visualisation |
 | 3 | `03_occupancy_forecast_validation_audit.py` | Forecast output validation and audit |
@@ -268,7 +282,7 @@ Scripts execute in the documented order. If a script fails, the pipeline stops a
 
 The `-B` option prevents Python from writing bytecode cache files.
 
-### Run the automated tests
+### 7.2 Run the automated tests
 
 To execute the complete test suite:
 
@@ -284,7 +298,7 @@ test/test_report.txt
 
 The command returns a non-zero exit status if the test suite fails.
 
-## Outputs
+## 8. Outputs
 
 The repository includes generated outputs from the project run so that the results can be inspected without rerunning the full pipeline. Running the scripts regenerates the corresponding output files in `outputs/`.
 
@@ -296,19 +310,26 @@ The repository includes generated outputs from the project run so that the resul
 | `occupancy_rolling_evaluation/` | Rolling evaluation metrics, predictions and class-level results |
 | `occupancy_sensitivity/` | Hyperparameter sensitivity results and validation predictions |
 
-## Documentation
+## 9. Development and Version Control
 
-HTML documentation for the seven analysis scripts is available in the `docs/` directory.
+Development was organised across separate branches to distinguish the initial modelling work from subsequent code quality and validation improvements.
 
-Open `docs/index.html` in a web browser to access the project documentation.
-"""
+| Branch | Development purpose |
+|---|---|
+| `occupancy-modelling` | Initial development of occupancy and environmental modelling approaches |
+| `refactor/occupancy-forecast` | Refactoring the forecasting code, improving readability, adding inline comments and documentation, and expanding testing and validation |
+| `main` | Consolidated project version containing the integrated modelling workflow and supporting documentation |
 
-out = "/mnt/data/README_MMA3001_updated.md"
-pypandoc.convert_text(
-    readme,
-    "md",
-    format="md",
-    outputfile=out,
-    extra_args=["--standalone"]
-)
-print(f"Created: {out}\nSize: {Path(out).stat().st_size:,} bytes")
+The `main` branch contains the integrated project. Development and refactoring work was carried out separately before being incorporated into the main branch.
+
+## 10. Documentation
+
+HTML documentation for the seven analysis scripts is generated using pdoc and is available in the `docs/` directory.
+
+Open the following file in a web browser:
+
+```text
+docs/index.html
+```
+
+The documentation provides an overview of the analysis modules, their functions and their implementation.
