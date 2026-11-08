@@ -22,7 +22,7 @@ The target represents the sensor's recorded classification rather than independe
 
 ## 2. Dataset
 
-The project uses an occupancy sensor dataset containing approximately 9.1 million raw observations.
+The dataset contains 9,091,732 raw observations across five floor spaces, spanning November 2023 to April 2026.
 
 **Dataset download:** [Download the occupancy sensor dataset (Google Drive)](https://drive.google.com/file/d/1NDrTZZYlD7QnbkZbh4w5BwsIyO8lAXIh/view?usp=sharing)
 
