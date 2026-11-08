@@ -28,6 +28,14 @@ The target represents the sensor's recorded classification rather than independe
 
 The project uses an occupancy sensor dataset containing approximately 9.1 million raw observations.
 
+**Dataset download:** [Download the occupancy sensor dataset (Google Drive)](https://drive.google.com/file/d/1NDrTZZYlD7QnbkZbh4w5BwsIyO8lAXIh/view?usp=sharing)
+
+The downloaded archive must be placed in the project's `data/` directory with the following filename:
+
+`5occupancySensor_MayToDec2024_9MRows.zip`
+
+The dataset is not stored in this Git repository because of its size. It must be downloaded separately before running the complete modelling pipeline.
+
 The original dataset includes fields relating to:
 
 - Floor-space identifiers
@@ -41,14 +49,16 @@ The original dataset includes fields relating to:
 
 The preprocessing workflow:
 
-1. Loads the compressed CSV dataset in chunks to manage memory usage.
+1. Loads the compressed CSV dataset in chunks of 250,000 rows.
 2. Converts observation timestamps to timezone-aware UTC values.
 3. Removes records missing required forecasting information.
 4. Assigns observations to five-minute intervals.
 5. Retains the latest observation for each floor-space and interval.
 6. Constructs forecasting samples using consecutive five-minute observations.
 
-After preprocessing, the dataset contains approximately **482,538 valid aggregated intervals**.
+Chunked CSV reading limits the size of each individual read operation. However, retained chunks are subsequently combined for downstream processing, so the complete modelling workflow is not strictly memory-bounded.
+
+After preprocessing, the dataset contains approximately **482,538 aggregated intervals**.
 
 Only consecutive five-minute observation pairs are retained for the forecasting task. Observations separated by longer gaps are excluded rather than treated as consecutive forecasts.
 
@@ -56,7 +66,7 @@ Only consecutive five-minute observation pairs are retained for the forecasting 
 
 ### Input Features
 
-The Random Forest model uses six input features:
+The main Random Forest model uses six input features:
 
 | Feature | Description |
 |---|---|
@@ -68,6 +78,8 @@ The Random Forest model uses six input features:
 | `is_weekend` | Indicates whether the observation falls on a weekend |
 
 The target variable is the recorded occupancy state at the next consecutive five-minute interval.
+
+The rolling evaluation and sensitivity analysis use additional temporal predictors, including the previous recorded occupancy state and an observation-gap feature. Their feature construction is described in the project report.
 
 ### Random Forest Classifier
 
@@ -128,26 +140,175 @@ The evaluation considers both overall predictive performance and the model's abi
 MMA3001_Project/
 │
 ├── data/
-│   └── Occupancy dataset ZIP
+│   └── .gitkeep
+│       └── 5occupancySensor_MayToDec2024_9MRows.zip  (download separately)
 │
-├── scripts/
-│   ├── 01_*.py
-│   ├── 02_occupancy_forecast_visualisation.py
-│   ├── 03_*.py
-│   ├── 04_*.py
-│   ├── 05_*.py
-│   ├── 06_*.py
-│   └── 07_*.py
-│
-├── test/
-│   └── test_run.py
+├── docs/
+│   ├── index.html
+│   ├── occupancy_modelling.html
+│   └── occupancy_modelling/
+│       └── HTML documentation for the seven analysis scripts
 │
 ├── outputs/
+│   ├── occupancy_timing_analysis/
 │   ├── occupancy_forecast_v2/
 │   ├── occupancy_forecast_visualisations/
 │   ├── occupancy_rolling_evaluation/
 │   └── occupancy_sensitivity/
 │
+├── src/
+│   └── occupancy_modelling/
+│       ├── 01_occupancy_timing_analysis.py
+│       ├── 02_occupancy_forecast_visualisation.py
+│       ├── 03_occupancy_forecast_validation_audit.py
+│       ├── 04_actual_forecasting.py
+│       ├── 05_rolling_occupancy_modelling.py
+│       ├── 06_rolling_class_analysis.py
+│       └── 07_occupancy_sensitivity.py
+│
+├── test/
+│   ├── test_class_analysis.py
+│   ├── test_forecasting.py
+│   ├── test_pipeline.py
+│   ├── test_rolling_evaluation.py
+│   ├── test_run.py
+│   ├── test_sensitivity.py
+│   ├── test_timing_analysis.py
+│   ├── test_validation.py
+│   └── test_report.txt
+│
+├── run.py
+├── requirements.txt
 ├── README.md
 ├── LICENSE
-└── requirements.txt
+├── .gitignore
+└── .gitattributes
+```
+
+## Installation and Setup
+
+The project uses **Python 3.10 or later** and the following main dependencies:
+
+- NumPy
+- Pandas
+- Matplotlib
+- Scikit-learn
+
+All required packages are specified in `requirements.txt`.
+
+### 1. Clone the repository
+
+```powershell
+git clone https://github.com/ria00011111111111/MMA3001_Project.git
+cd MMA3001_Project
+```
+
+### 2. Create a virtual environment
+
+```powershell
+py -3 -m venv .venv
+```
+
+Activate the environment:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+### 3. Install dependencies
+
+Upgrade pip and install the required Python packages:
+
+```powershell
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 4. Download the dataset
+
+Download the [occupancy sensor dataset](https://drive.google.com/file/d/1NDrTZZYlD7QnbkZbh4w5BwsIyO8lAXIh/view?usp=sharing).
+
+Create the data directory if it does not already exist:
+
+```powershell
+New-Item -ItemType Directory -Force -Path .\data
+```
+
+Place the downloaded ZIP archive directly inside `data/` and ensure its filename is:
+
+```text
+5occupancySensor_MayToDec2024_9MRows.zip
+```
+
+**Do not extract the ZIP archive.** The modelling scripts read the compressed CSV directly.
+
+## Running the Project
+
+### Run the complete modelling pipeline
+
+From the project root, execute:
+
+```powershell
+python -B .\run.py
+```
+
+The main runner executes the seven analysis scripts sequentially:
+
+| Order | Script | Purpose |
+|---:|---|---|
+| 1 | `01_occupancy_timing_analysis.py` | Occupancy observation timing and state-transition analysis |
+| 2 | `02_occupancy_forecast_visualisation.py` | Forecast model training, evaluation and visualisation |
+| 3 | `03_occupancy_forecast_validation_audit.py` | Forecast output validation and audit |
+| 4 | `04_actual_forecasting.py` | Actual elapsed-time analysis of forecasting pairs |
+| 5 | `05_rolling_occupancy_modelling.py` | Rolling chronological model evaluation |
+| 6 | `06_rolling_class_analysis.py` | Class-level rolling evaluation analysis |
+| 7 | `07_occupancy_sensitivity.py` | Random Forest hyperparameter sensitivity analysis |
+
+Scripts execute in the documented order. If a script fails, the pipeline stops and reports the failure rather than continuing with incomplete outputs.
+
+The `-B` option prevents Python from writing bytecode cache files.
+
+### Run the automated tests
+
+To execute the complete test suite:
+
+```powershell
+python -B .\test\test_run.py
+```
+
+The test runner discovers the test modules in `test/`, executes the suite and writes a report to:
+
+```text
+test/test_report.txt
+```
+
+The command returns a non-zero exit status if the test suite fails.
+
+## Outputs
+
+The repository includes generated outputs from the project run so that the results can be inspected without rerunning the full pipeline. Running the scripts regenerates the corresponding output files in `outputs/`.
+
+| Directory | Contents |
+|---|---|
+| `occupancy_timing_analysis/` | Observation timing, state transitions and aggregated occupancy intervals |
+| `occupancy_forecast_v2/` | Forecast predictions, model comparisons and validation audit results |
+| `occupancy_forecast_visualisations/` | Forecast figures, feature importance and visualisation summaries |
+| `occupancy_rolling_evaluation/` | Rolling evaluation metrics, predictions and class-level results |
+| `occupancy_sensitivity/` | Hyperparameter sensitivity results and validation predictions |
+
+## Documentation
+
+HTML documentation for the seven analysis scripts is available in the `docs/` directory.
+
+Open `docs/index.html` in a web browser to access the project documentation.
+"""
+
+out = "/mnt/data/README_MMA3001_updated.md"
+pypandoc.convert_text(
+    readme,
+    "md",
+    format="md",
+    outputfile=out,
+    extra_args=["--standalone"]
+)
+print(f"Created: {out}\nSize: {Path(out).stat().st_size:,} bytes")
