@@ -95,6 +95,8 @@ TEST_PERIOD_START = pd.Timestamp(
     tz="UTC",
 )
 
+# Test a small grid of tree depths and minimum leaf sizes to examine
+# how model complexity affects validation performance.
 DEPTH_VALUES = [8, 12, 16]
 LEAF_VALUES = [5, 10, 20]
 
@@ -102,6 +104,8 @@ RANDOM_STATE = 42
 N_ESTIMATORS = 100
 VALIDATION_FRACTION = 0.20
 
+# Use a fixed class order so that all model evaluations report
+# occupancy categories consistently, including less frequent classes.
 STATE_ORDER = [
     "CurrentlyOccupied",
     "NotOccupied",
@@ -187,6 +191,8 @@ def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
     rows_read = 0
 
     with ZipFile(zip_path) as archive:
+        # Select CSV inputs from the archive rather than requiring the
+        # large source dataset to be extracted before processing.
         csv_files = [
             name
             for name in archive.namelist()
@@ -212,26 +218,33 @@ def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
                 ),
                 start=1,
             ):
+                # Check the schema of each chunk before attempting
+                # timestamp conversion or aggregation.
                 missing = required_columns - set(chunk.columns)
                 if missing:
                     raise ValueError(
                         f"Missing required columns: {sorted(missing)}"
                     )
 
-                # Preserve source order to resolve equal timestamps
-                # consistently across chunks.
+                # Preserve the original row order across chunks so that
+                # observations with identical timestamps can be resolved
+                # consistently.
                 chunk["_source_order"] = np.arange(
                     rows_read,
                     rows_read + len(chunk),
                 )
                 rows_read += len(chunk)
 
+                # Convert timestamps to UTC and mark unparseable values
+                # as missing so they can be excluded during cleaning.
                 chunk["collecteddate"] = pd.to_datetime(
                     chunk["collecteddate"],
                     errors="coerce",
                     utc=True,
                 )
 
+                # Exclude records that cannot provide a valid floor-space,
+                # occupancy state, or observation timestamp.
                 chunk = chunk.dropna(
                     subset=[
                         "floorspaceid",
@@ -240,10 +253,14 @@ def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
                     ]
                 ).copy()
 
+                # Assign each valid observation to its five-minute bin
+                # while retaining its original collection timestamp.
                 chunk["interval"] = chunk["collecteddate"].dt.floor(
                     BIN_SIZE
                 )
 
+                # Sort before deduplication so that keep="last" retains
+                # the latest observation within each interval.
                 chunk = chunk.sort_values(
                     ["collecteddate", "_source_order"]
                 )
@@ -253,6 +270,8 @@ def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
                     keep="last",
                 )
 
+                # Retain only the fields required for subsequent
+                # forecasting feature construction.
                 aggregated_chunks.append(
                     chunk[
                         [
@@ -273,10 +292,13 @@ def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
     if not aggregated_chunks:
         raise ValueError("No usable occupancy records were found.")
 
+    # Combine chunk-level results so duplicate floor-space intervals
+    # occurring in different chunks can also be resolved.
     intervals = pd.concat(aggregated_chunks, ignore_index=True)
     del aggregated_chunks
 
-    # Resolve duplicate bins that occur across different chunks.
+    # Resolve duplicate bins across chunks using the original timestamp
+    # and source order to retain the latest observation consistently.
     intervals = intervals.sort_values(
         ["collecteddate", "_source_order"]
     )
@@ -286,6 +308,8 @@ def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
         keep="last",
     )
 
+    # Restore chronological ordering within each floor space for
+    # subsequent previous-observation and target calculations.
     intervals = intervals.sort_values(
         ["floorspaceid", "interval"]
     ).reset_index(drop=True)
@@ -336,11 +360,15 @@ def build_forecast_pairs(intervals: pd.DataFrame) -> pd.DataFrame:
     """
     intervals = intervals.copy()
 
+    # Calculate previous observations separately for each floor space
+    # to prevent data from different spaces being mixed.
     grouped = intervals.groupby("floorspaceid")
 
     intervals["previous_state"] = grouped["occupancystatus"].shift(1)
     intervals["previous_interval"] = grouped["interval"].shift(1)
 
+    # Measure the gap between consecutive recorded intervals and apply
+    # log1p to reduce the influence of unusually large observation gaps.
     intervals["gap_minutes"] = (
         intervals["interval"] - intervals["previous_interval"]
     ).dt.total_seconds() / 60.0
@@ -349,6 +377,7 @@ def build_forecast_pairs(intervals: pd.DataFrame) -> pd.DataFrame:
         intervals["gap_minutes"].clip(lower=0)
     )
 
+    # Extract temporal predictors from the current interval timestamp.
     intervals["hour"] = intervals["interval"].dt.hour
     intervals["day_of_week"] = intervals["interval"].dt.dayofweek
     intervals["month"] = intervals["interval"].dt.month
@@ -356,6 +385,8 @@ def build_forecast_pairs(intervals: pd.DataFrame) -> pd.DataFrame:
         intervals["day_of_week"] >= 5
     ).astype(int)
 
+    # Create a separate target table so current observations can be
+    # matched against the occupancy state in their future interval.
     targets = intervals[
         ["floorspaceid", "interval", "occupancystatus"]
     ].rename(
@@ -365,11 +396,14 @@ def build_forecast_pairs(intervals: pd.DataFrame) -> pd.DataFrame:
         }
     )
 
-    # An observation is paired only with a target exactly five minutes later.
+    # Shift target timestamps backwards by five minutes to identify
+    # the current interval associated with each future target.
     targets["origin_interval"] = (
         targets["target_interval"] - pd.Timedelta(minutes=5)
     )
 
+    # An inner join retains only current observations with an available
+    # target in the exact next five-minute interval.
     data = intervals.merge(
         targets,
         left_on=["floorspaceid", "interval"],
@@ -382,11 +416,14 @@ def build_forecast_pairs(intervals: pd.DataFrame) -> pd.DataFrame:
         columns={"occupancystatus": "current_state"}
     )
 
+    # Remove observations that lack the previous-state information or
+    # other features required by the forecasting model.
     data = data.dropna(
         subset=FEATURES + ["target_state", "target_interval"]
     ).copy()
 
-    # Exclude the original test period from both training and validation.
+    # Exclude the original held-out test period to prevent it from
+    # influencing hyperparameter selection.
     data = data.loc[
         data["target_interval"] < TEST_PERIOD_START
     ].copy()
@@ -398,6 +435,8 @@ def build_forecast_pairs(intervals: pd.DataFrame) -> pd.DataFrame:
             "No eligible forecast pairs remain before the test cutoff."
         )
 
+    # Check target labels against the expected occupancy-state domain
+    # before calculating classification metrics.
     unknown_states = set(data["target_state"].unique()) - set(STATE_ORDER)
     if unknown_states:
         raise ValueError(
@@ -447,6 +486,8 @@ def chronological_split(
         the validation split. The cutoff has already been applied during
         forecast-pair construction.
     """
+    # Split using unique timestamps rather than individual rows so that
+    # observations with the same target time remain in the same dataset.
     unique_times = np.sort(data["target_interval"].unique())
 
     if len(unique_times) < 10:
@@ -461,6 +502,8 @@ def chronological_split(
 
     validation_start = pd.Timestamp(unique_times[split_index])
 
+    # Assign all earlier target timestamps to training and all subsequent
+    # timestamps to validation to preserve chronological evaluation.
     train = data.loc[
         data["target_interval"] < validation_start
     ].copy()
@@ -472,6 +515,8 @@ def chronological_split(
     if train.empty or validation.empty:
         raise ValueError("Training or validation split is empty.")
 
+    # Confirm that the latest training target occurs strictly before
+    # the first validation target.
     if train["target_interval"].max() >= validation["target_interval"].min():
         raise ValueError("Training and validation target times overlap.")
 
@@ -528,6 +573,8 @@ def evaluate_predictions(
         ``zero_division=0`` setting assigns zero when a metric would
         otherwise be undefined.
     """
+    # Calculate overall metrics to compare model performance across
+    # both the majority and minority occupancy classes.
     summary_row = {
         "model": model_name,
         "max_depth": depth,
@@ -552,6 +599,8 @@ def evaluate_predictions(
         ),
     }
 
+    # Generate a consistent per-class report so performance on rare
+    # occupancy states is not hidden by the dominant class.
     report = classification_report(
         y_val,
         predictions,
@@ -611,6 +660,8 @@ def build_model(depth: int, leaf_size: int) -> Pipeline:
         ensuring that categorical encoding is learned from the training
         data when ``fit`` is called.
     """
+    # Encode categorical predictors while passing numerical features
+    # directly to the classifier.
     preprocessor = ColumnTransformer(
         transformers=[
             (
@@ -623,6 +674,8 @@ def build_model(depth: int, leaf_size: int) -> Pipeline:
         remainder="drop",
     )
 
+    # Keep preprocessing and classification in one pipeline so the
+    # encoder is fitted only on the training data.
     return Pipeline(
         steps=[
             ("preprocessor", preprocessor),
@@ -684,6 +737,8 @@ def save_results(
     """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Rank configurations primarily by macro F1, using balanced accuracy
+    # as a secondary sorting criterion.
     summary = pd.DataFrame(summary_rows).sort_values(
         ["macro_f1", "balanced_accuracy"],
         ascending=False,
@@ -701,6 +756,8 @@ def save_results(
     summary.to_csv(summary_path, index=False)
     class_metrics.to_csv(class_path, index=False)
 
+    # Retain the original validation identifiers and actual states so
+    # each saved prediction can be traced to its corresponding observation.
     prediction_output = validation[MODEL_COLUMNS].copy()
 
     for model_name, predictions in predictions_by_model.items():
@@ -714,6 +771,8 @@ def save_results(
 
     prediction_output.to_csv(predictions_path, index=False)
 
+    # Restrict best-configuration selection to Random Forest candidates;
+    # the majority and persistence baselines are comparison models.
     random_forest_results = summary[
         summary["model"].str.startswith("Random Forest")
     ]
@@ -721,6 +780,9 @@ def save_results(
     if random_forest_results.empty:
         raise ValueError("No Random Forest results were generated.")
 
+    # Select the configuration with the highest validation macro F1.
+    # This identifies the best candidate within this sensitivity analysis,
+    # not a configuration independently verified on the held-out test set.
     best = random_forest_results.iloc[0]
 
     with report_path.open("w", encoding="utf-8") as report_file:
@@ -821,6 +883,7 @@ def main() -> None:
     data = build_forecast_pairs(intervals)
     train, validation = chronological_split(data)
 
+    # Separate predictors and target labels for model fitting and evaluation.
     X_train = train[FEATURES]
     y_train = train["target_state"]
     X_val = validation[FEATURES]
@@ -832,9 +895,12 @@ def main() -> None:
 
     print("\n[3/4] Evaluating baselines...")
 
+    # The majority baseline always predicts the most frequent training class.
     majority_model = DummyClassifier(strategy="most_frequent")
     majority_model.fit(X_train, y_train)
 
+    # The persistence baseline assumes the current recorded occupancy
+    # state remains unchanged at the next five-minute interval.
     baseline_predictions = {
         "Majority baseline": majority_model.predict(X_val),
         "Persistence baseline": X_val["current_state"].to_numpy(),
@@ -858,6 +924,8 @@ def main() -> None:
 
     print("\n[4/4] Evaluating Random Forest configurations...")
 
+    # Evaluate every combination of tree depth and minimum leaf size
+    # using the same chronological training and validation datasets.
     for depth in DEPTH_VALUES:
         for leaf_size in LEAF_VALUES:
             model_name = (
@@ -884,6 +952,8 @@ def main() -> None:
             summary_rows.append(summary_row)
             class_rows.extend(per_class_rows)
 
+    # Save all baseline and Random Forest results using the same validation
+    # observations so their reported performance can be compared directly.
     save_results(
         summary_rows,
         class_rows,

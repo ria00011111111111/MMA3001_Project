@@ -1,3 +1,4 @@
+
 """Evaluate occupancy forecasting using expanding chronological windows.
 
 The script aggregates occupancy sensor readings into five-minute intervals,
@@ -68,10 +69,15 @@ ZIP_FILE = (
 )
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "occupancy_rolling_evaluation"
 
+# Process the source CSV in chunks to avoid loading the entire file at once.
 CHUNK_SIZE = 250_000
+
+# Define the forecast horizon used to construct exact next-interval targets.
 FORECAST_MINUTES = 5
 TARGET = "occupancystatus"
 
+# Separate categorical and numerical inputs so each group can receive
+# appropriate preprocessing before being passed to the classifier.
 CATEGORICAL_FEATURES = [
     "floorspaceid",
     "current_state",
@@ -87,12 +93,15 @@ NUMERIC_FEATURES = [
 FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
 # Keep this list aligned with the labels used by the source dataset.
+# A fixed class order ensures consistent metric calculations across windows.
 STATE_ORDER = [
     "CurrentlyOccupied",
     "NotOccupied",
     "RecentlyOccupied",
 ]
 
+# Use the same Random Forest configuration for all three evaluation windows
+# so that performance differences reflect the changing training periods.
 RANDOM_FOREST_SETTINGS = {
     "n_estimators": 100,
     "max_depth": 12,
@@ -133,6 +142,7 @@ def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
         observation timestamp to a five-minute boundary. It is not a
         replacement for the original sensor timestamp.
     """
+    # Check that the source dataset is available before opening the archive.
     if not zip_path.is_file():
         raise FileNotFoundError(f"Input ZIP file not found: {zip_path}")
 
@@ -140,6 +150,8 @@ def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
     rows_read = 0
 
     with ZipFile(zip_path) as archive:
+        # Require a single source CSV to avoid accidentally combining
+        # unrelated datasets from the same archive.
         csv_files = [
             name for name in archive.namelist()
             if name.lower().endswith(".csv")
@@ -151,6 +163,7 @@ def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
             )
 
         with archive.open(csv_files[0]) as source:
+            # Read only the fields required for aggregation and forecasting.
             for chunk in pd.read_csv(
                 source,
                 usecols=["floorspaceid", TARGET, "collecteddate"],
@@ -158,12 +171,20 @@ def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
                 low_memory=False,
             ):
                 rows_read += len(chunk)
+
+                # Convert timestamps to a consistent timezone and treat
+                # unparseable timestamps as missing rather than valid data.
                 chunk["collecteddate"] = pd.to_datetime(
                     chunk["collecteddate"], utc=True, errors="coerce"
                 )
+
+                # Remove records that cannot be assigned to a floor space,
+                # occupancy state, or time interval.
                 chunk = chunk.dropna(
                     subset=["floorspaceid", TARGET, "collecteddate"]
                 )
+
+                # Assign each observation to its corresponding five-minute bin.
                 chunk["interval"] = chunk["collecteddate"].dt.floor("5min")
                 chunks.append(chunk)
                 print(f"Read {rows_read:,} raw rows...")
@@ -171,18 +192,24 @@ def load_occupancy_data(zip_path: Path) -> pd.DataFrame:
     if not chunks:
         raise ValueError("The source CSV contained no data rows.")
 
+    # Combine the cleaned chunks before deduplication so duplicate
+    # floor-space/interval records across chunk boundaries are also handled.
     data = pd.concat(chunks, ignore_index=True)
     del chunks
 
     if data.empty:
         raise ValueError("No valid occupancy rows remained after cleaning.")
 
-    # Retain the latest source observation in each floor-space/time bin.
+    # Retain the latest recorded observation when multiple readings fall
+    # within the same floor-space/time bin.
     data = data.sort_values(
         ["floorspaceid", "interval", "collecteddate"]
     ).drop_duplicates(
         subset=["floorspaceid", "interval"], keep="last"
     )
+
+    # Sort by floor space and time so subsequent grouped operations can
+    # reliably identify previous observations.
     return data.sort_values(
         ["floorspaceid", "interval"]
     ).reset_index(drop=True)
@@ -222,30 +249,43 @@ def build_forecast_rows(data: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         sensor observations to differ from five minutes, even when their
         interval timestamps are consecutive.
     """
+    # Work on a copy so feature engineering does not modify the aggregated
+    # observations used elsewhere in the evaluation.
     data = data.copy()
     data["current_state"] = data[TARGET]
 
+    # Calculate previous observations independently within each floor space
+    # to prevent readings from different spaces being mixed together.
     grouped = data.groupby("floorspaceid", sort=False)
     data["previous_state"] = grouped[TARGET].shift(1)
     data["previous_timestamp"] = grouped["collecteddate"].shift(1)
 
+    # Measure the elapsed time between original sensor readings rather than
+    # assuming that consecutive interval bins are exactly five minutes apart.
     data["gap_minutes"] = (
         data["collecteddate"] - data["previous_timestamp"]
     ).dt.total_seconds() / 60
+
+    # Exclude non-positive gaps and cap unusually large gaps before applying
+    # the logarithmic transform to reduce the influence of extreme values.
     data.loc[data["gap_minutes"] <= 0, "gap_minutes"] = np.nan
     data["log_gap_minutes"] = np.log1p(
         data["gap_minutes"].clip(upper=1440)
     )
 
+    # Extract calendar features from the current forecast-origin interval.
     data["hour"] = data["interval"].dt.hour
     data["day_of_week"] = data["interval"].dt.dayofweek
     data["month"] = data["interval"].dt.month
     data["is_weekend"] = (data["day_of_week"] >= 5).astype(int)
+
+    # Define the exact future interval that the current observation must predict.
     data["target_interval"] = (
         data["interval"] + pd.Timedelta(minutes=FORECAST_MINUTES)
     )
 
-    # Lookup table of observed states in each target interval.
+    # Build a lookup table of observed occupancy states indexed by their
+    # floor space and interval, allowing exact future-target matching.
     future = data[["floorspaceid", "interval", TARGET]].rename(
         columns={
             "interval": "target_interval",
@@ -253,6 +293,8 @@ def build_forecast_rows(data: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         }
     )
 
+    # Match each forecast origin to the exact next interval.
+    # A left join preserves unmatched origins so they can be counted.
     candidates = data.merge(
         future,
         on=["floorspaceid", "target_interval"],
@@ -263,14 +305,21 @@ def build_forecast_rows(data: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     total_rows = len(candidates)
     missing_target_rows = int((candidates["_merge"] == "left_only").sum())
 
+    # Keep only rows with a matched future state and the historical
+    # information needed to calculate the forecasting features.
     eligible = candidates.drop(columns="_merge").dropna(
         subset=["future_state", "previous_state", "log_gap_minutes"]
     ).copy()
+
+    # Store the matched future state as the prediction target and order
+    # the resulting records by target time and floor space.
     eligible[TARGET] = eligible["future_state"]
     eligible = eligible.sort_values(
         ["target_interval", "floorspaceid"]
     ).reset_index(drop=True)
 
+    # Track how many records are lost at each stage so forecast-row
+    # eligibility can be assessed independently of model performance.
     counts = {
         "aggregated_intervals": total_rows,
         "rows_without_exact_next_bin": missing_target_rows,
@@ -300,6 +349,8 @@ def make_model() -> Pipeline:
         pipeline, so their parameters are learned from the training data
         when ``fit`` is called.
     """
+    # Apply separate preprocessing to categorical and numerical inputs
+    # while keeping both transformations within a single model pipeline.
     preprocessing = ColumnTransformer(
         transformers=[
             (
@@ -322,6 +373,9 @@ def make_model() -> Pipeline:
         ],
         remainder="drop",
     )
+
+    # Keeping preprocessing and classification together ensures that
+    # imputation and encoding are fitted using training data only.
     return Pipeline(
         steps=[
             ("preprocessing", preprocessing),
@@ -362,6 +416,8 @@ def create_windows(data: pd.DataFrame) -> list[dict]:
         60–70%, 70–80%, and 80–90% of the timestamps. The final 10% is not
         included in these evaluation windows.
     """
+    # Split using unique target timestamps rather than individual rows so
+    # observations sharing a target time cannot be divided across sets.
     unique_times = np.sort(data["target_interval"].dropna().unique())
     if len(unique_times) < 100:
         raise ValueError(
@@ -369,10 +425,15 @@ def create_windows(data: pd.DataFrame) -> list[dict]:
         )
 
     n_times = len(unique_times)
+
+    # Establish chronological boundaries for three consecutive test periods.
+    # Each later training set includes the earlier training and test periods.
     cutoffs = [int(n_times * fraction) for fraction in (0.60, 0.70, 0.80, 0.90)]
     if any(cutoffs[i] >= cutoffs[i + 1] for i in range(len(cutoffs) - 1)):
         raise ValueError("Not enough timestamps to create non-empty windows.")
 
+    # Use the preceding timestamp as the training boundary and the next
+    # segment as the test period for each expanding window.
     return [
         {
             "window": f"Window {index + 1}",
@@ -441,13 +502,15 @@ def evaluate_windows(
         test_start = pd.Timestamp(window["test_start"])
         test_end = pd.Timestamp(window["test_end"])
 
+        # Select all targets up to the training cutoff and only the
+        # corresponding later chronological segment for testing.
         train = data[data["target_interval"] <= train_end].copy()
         test = data[
             (data["target_interval"] >= test_start)
             & (data["target_interval"] <= test_end)
         ].copy()
 
-        # Defensive checks make the intended chronology explicit.
+        # Skip windows that cannot support a meaningful model evaluation.
         if train.empty or test.empty:
             print(f"Skipping {name}: empty training or test set.")
             continue
@@ -457,17 +520,27 @@ def evaluate_windows(
             print(f"Skipping {name}: fewer than two training classes.")
             continue
 
+        # Separate the model inputs from the future occupancy state to be
+        # predicted for each training and test observation.
         X_train, y_train = train[FEATURES], train[TARGET]
         X_test, y_test = test[FEATURES], test[TARGET]
 
+        # The majority baseline uses only the most frequent training class.
         majority_class = y_train.value_counts().idxmax()
         majority_predictions = np.repeat(majority_class, len(test))
+
+        # The persistence baseline assumes the current occupancy state
+        # remains unchanged over the forecast horizon.
         persistence_predictions = X_test["current_state"].to_numpy()
 
+        # Fit a fresh Random Forest for each window so that each model
+        # uses only the training data available at that point in time.
         model = make_model()
         model.fit(X_train, y_train)
         rf_predictions = model.predict(X_test)
 
+        # Keep all three prediction approaches together for consistent
+        # metric calculation and output generation.
         predictions_by_model = {
             "Majority baseline": majority_predictions,
             "Persistence baseline": persistence_predictions,
@@ -481,6 +554,7 @@ def evaluate_windows(
         print(f"Training rows: {len(train):,}")
         print(f"Testing rows:  {len(test):,}")
 
+        # Evaluate every model against the same actual test labels.
         for model_name, predictions in predictions_by_model.items():
             results.append({
                 "window": name,
@@ -502,6 +576,8 @@ def evaluate_windows(
                 ),
             })
 
+        # Preserve row-level predictions so model errors and individual
+        # occupancy-state changes can be inspected after evaluation.
         prediction_tables.append(pd.DataFrame({
             "window": name,
             "target_interval": test["target_interval"].to_numpy(),
@@ -512,6 +588,8 @@ def evaluate_windows(
             "random_forest_prediction": rf_predictions,
         }))
 
+    # Prevent empty output files from being generated if every window
+    # was skipped during the evaluation process.
     if not results or not prediction_tables:
         raise RuntimeError("No rolling evaluation windows completed.")
 
@@ -543,14 +621,19 @@ def main() -> None:
     print("ROLLING CHRONOLOGICAL OCCUPANCY FORECAST EVALUATION")
     print("=" * 70)
 
+    # Load and aggregate the source sensor observations before constructing
+    # the forecast dataset.
     data = load_occupancy_data(ZIP_FILE)
     print(f"\nAggregated intervals: {len(data):,}")
 
+    # Match exact next-interval targets and record how many observations
+    # remain eligible for forecasting after feature construction.
     forecast_rows, counts = build_forecast_rows(data)
     print("\nFORECAST ROW COUNTS")
     for label, value in counts.items():
         print(f"{label.replace('_', ' ').capitalize()}: {value:,}")
 
+    # Stop if the source data cannot produce any valid forecasting examples.
     if forecast_rows.empty:
         raise ValueError("No eligible forecasting rows were generated.")
 
@@ -561,14 +644,20 @@ def main() -> None:
         forecast_rows["target_interval"].max(),
     )
 
+    # Generate the expanding chronological windows and evaluate all models
+    # using the same window boundaries for a fair comparison.
     windows = create_windows(forecast_rows)
     results, predictions = evaluate_windows(forecast_rows, windows)
 
+    # Save outputs in a dedicated directory to keep the rolling evaluation
+    # separate from the main occupancy forecasting pipeline.
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     metrics_path = OUTPUT_DIR / "rolling_evaluation_metrics.csv"
     predictions_path = OUTPUT_DIR / "rolling_evaluation_predictions.csv"
     counts_path = OUTPUT_DIR / "rolling_evaluation_row_counts.csv"
 
+    # Store aggregate performance, row-level predictions, and eligibility
+    # counts separately to support different forms of analysis.
     results.to_csv(metrics_path, index=False)
     predictions.to_csv(predictions_path, index=False)
     pd.DataFrame([counts]).to_csv(counts_path, index=False)
@@ -576,6 +665,8 @@ def main() -> None:
     print("\n" + "=" * 70)
     print("ROLLING EVALUATION RESULTS")
     print("=" * 70)
+
+    # Display the main performance measures in a compact summary table.
     print(
         results[
             [
@@ -599,4 +690,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Run the rolling evaluation when the script is executed directly.
     main()

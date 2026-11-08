@@ -44,20 +44,24 @@ OUTPUT_DIR = PROJECT_ROOT / "outputs" / "occupancy_rolling_evaluation"
 INPUT_FILE = OUTPUT_DIR / "rolling_evaluation_predictions.csv"
 OUTPUT_FILE = OUTPUT_DIR / "rolling_class_level_metrics.csv"
 
-# Keep this order consistent across evaluation scripts.
+# Use a fixed class order so results remain directly comparable across
+# models, evaluation windows, and other occupancy analysis scripts.
 STATE_ORDER = [
     "CurrentlyOccupied",
     "NotOccupied",
     "RecentlyOccupied",
 ]
 
-# Human-readable model names mapped to their prediction columns.
+# Map readable model names to the corresponding columns in the saved
+# predictions file, allowing the same evaluation procedure for each model.
 MODEL_COLUMNS = {
     "Majority baseline": "majority_prediction",
     "Persistence baseline": "persistence_prediction",
     "Random Forest": "random_forest_prediction",
 }
 
+# Require only the fields needed to identify each window, compare predictions,
+# and calculate class-level metrics.
 REQUIRED_COLUMNS = {
     "window",
     "actual_state",
@@ -89,6 +93,8 @@ def load_predictions(input_file: Path) -> pd.DataFrame:
         Additional columns in the input file are retained but are not
         required for the class-level calculations.
     """
+    # Stop execution if the rolling evaluation has not generated its
+    # prediction file, rather than attempting to analyse missing data.
     if not input_file.is_file():
         raise FileNotFoundError(
             f"Predictions file not found: {input_file}"
@@ -96,6 +102,7 @@ def load_predictions(input_file: Path) -> pd.DataFrame:
 
     data = pd.read_csv(input_file)
 
+    # Check the input schema before accessing columns used by the analysis.
     missing_columns = REQUIRED_COLUMNS - set(data.columns)
     if missing_columns:
         raise ValueError(
@@ -103,9 +110,12 @@ def load_predictions(input_file: Path) -> pd.DataFrame:
             f"{sorted(missing_columns)}"
         )
 
+    # An empty dataset cannot produce meaningful classification metrics.
     if data.empty:
         raise ValueError("The predictions file contains no rows.")
 
+    # Reject incomplete records so missing predictions are not silently
+    # excluded or interpreted as valid occupancy classes.
     if data[list(REQUIRED_COLUMNS)].isna().any().any():
         raise ValueError(
             "Required prediction columns contain missing values. "
@@ -156,8 +166,12 @@ def calculate_class_metrics(data: pd.DataFrame) -> pd.DataFrame:
         evaluation window. In such cases, the corresponding support or
         metric values may be zero.
     """
+    # Accumulate one record per window, model, and occupancy class before
+    # converting the results into a DataFrame.
     results = []
 
+    # Evaluate windows independently to preserve the chronological test
+    # structure of the rolling evaluation.
     for window in sorted(data["window"].unique()):
         window_data = data[data["window"] == window]
 
@@ -166,22 +180,31 @@ def calculate_class_metrics(data: pd.DataFrame) -> pd.DataFrame:
         print("=" * 75)
         print(f"Test rows: {len(window_data):,}")
 
+        # Apply the same metric calculation to each model using the actual
+        # occupancy states from the current evaluation window.
         for model_name, prediction_column in MODEL_COLUMNS.items():
             report = classification_report(
                 window_data["actual_state"],
                 window_data[prediction_column],
+                # Explicit labels prevent classes from disappearing when
+                # they are absent from a particular window's predictions.
                 labels=STATE_ORDER,
                 target_names=STATE_ORDER,
                 output_dict=True,
+                # Assign zero to undefined metrics so every class has
+                # a consistent numeric result in the output.
                 zero_division=0,
             )
 
+            # Print a readable summary for checking results during execution.
             print(f"\n{model_name}")
             print(
                 f"{'Class':<22} {'Precision':>10} "
                 f"{'Recall':>10} {'F1':>10} {'Support':>10}"
             )
 
+            # Extract each class separately, excluding aggregate metrics
+            # such as accuracy, macro average, and weighted average.
             for state in STATE_ORDER:
                 metrics = report[state]
                 support = int(metrics["support"])
@@ -194,6 +217,8 @@ def calculate_class_metrics(data: pd.DataFrame) -> pd.DataFrame:
                     f"{support:>10,}"
                 )
 
+                # Store the class-level results alongside their window and
+                # model identifiers so comparisons remain traceable.
                 results.append({
                     "window": window,
                     "model": model_name,
@@ -225,9 +250,13 @@ def main() -> None:
     print("ROLLING OCCUPANCY CLASS-LEVEL ANALYSIS")
     print("=" * 75)
 
+    # Load the existing predictions and calculate metrics without
+    # retraining models or changing the source evaluation results.
     predictions = load_predictions(INPUT_FILE)
     results = calculate_class_metrics(predictions)
 
+    # Create the output directory if it does not already exist, then save
+    # the class-level results independently of the original predictions.
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     results.to_csv(OUTPUT_FILE, index=False)
 
@@ -236,4 +265,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Run the analysis only when this file is executed directly.
     main()
